@@ -2364,9 +2364,11 @@ func (s *xdcSyncer) fullSyncOnce() {
 		// #951 Defect 1c (Part B): before the slow rollback, try the fast fork-heal —
 		// fetch the co-signed sibling of the batch's missing parent and adopt it so
 		// bc.reorg swaps the empty-N fork tip for the co-signed canonical in one step.
+		// V2 chains get the parallel shadow-sibling heal (competing-slot roulette).
 		// On a heal, fall through to the success bookkeeping below (stuck-state reset,
 		// XdcForkRecovering clear, HandleProposedBlock); on a miss, roll back as before.
-		if !(errors.Is(err, consensus.ErrUnknownAncestor) && s.adoptCoSignedSibling(blocks, peer)) {
+		if !(errors.Is(err, consensus.ErrUnknownAncestor) &&
+			(s.adoptCoSignedSibling(blocks, peer) || s.adoptV2ShadowSibling(blocks, peer))) {
 			s.maybeRollbackOnUnknownAncestor(fromBlock, peer, err)
 			return
 		}
@@ -2434,8 +2436,10 @@ func (s *xdcSyncer) fullSyncOnce() {
 			log.Warn("xdcSyncer: A.77 lookahead InsertChain failed",
 				"from", lhFrom, "attempted", len(lhBlocks), "inserted", lhN, "err", lhErr)
 			// #951 Defect 1c (Part B): same fast fork-heal as range 0 — adopt the
-			// co-signed sibling before falling back to the slow rollback.
-			if !(errors.Is(lhErr, consensus.ErrUnknownAncestor) && s.adoptCoSignedSibling(lhBlocks, lhRes.peer)) {
+			// co-signed sibling (V1) or the QC'd shadow sibling (V2) before falling
+			// back to the slow rollback.
+			if !(errors.Is(lhErr, consensus.ErrUnknownAncestor) &&
+				(s.adoptCoSignedSibling(lhBlocks, lhRes.peer) || s.adoptV2ShadowSibling(lhBlocks, lhRes.peer))) {
 				s.maybeRollbackOnUnknownAncestor(lhFrom, lhRes.peer, lhErr)
 				return
 			}
@@ -2572,6 +2576,90 @@ func (s *xdcSyncer) adoptCoSignedSibling(blocks types.Blocks, peer *eth.Peer) bo
 		return false
 	}
 	log.Info("xdcSyncer: adopted co-signed sibling (Defect 1c fast fork-heal)",
+		"siblingNum", parentNum, "siblingHash", parentHash,
+		"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
+	// Back on canonical — clear fork-recovery so the miner can resume sealing.
+	core.XdcForkRecovering.Store(false)
+	return true
+}
+
+// adoptV2ShadowSibling is the V2 counterpart of adoptCoSignedSibling, for the
+// competing-slot shadow-fork case: the local head is a timed-out (never QC'd)
+// shadow proposal S at height H, while the canonical chain advanced through the
+// QC'd sibling C at the same height. The next batch then starts at C'(H+1) whose
+// parent C(H) was never received — InsertChain fails ErrUnknownAncestor, and the
+// #801 rollback path would otherwise burn the 8,192-block budget until the hard
+// stop ("stuck on fork past rollback cap"; observed on chain 20118 at head
+// 96,142/from 96,143, and on every xone run since 2026-10-03).
+//
+// Mechanism (identical fetch-insert shape to the V1 co-signed heal, different
+// fork semantics): fetch the missing parent C by hash from the same peer,
+// InsertChain it as a side block — FULL consensus validation runs (QC
+// signatures, signer set, state roots; nothing is relaxed) — and let the V2
+// QC-chain fork choice reorg the head from S to C, exactly as validators do
+// ~19s after each shadow. Then re-insert the batch, which now extends the
+// canonical chain. No rollback, no SetHead, no validation bypass.
+//
+// Guards: fires only when (a) the chain is V2 at parentNum (V1 is served by
+// adoptCoSignedSibling), (b) the batch's parent is genuinely absent (otherwise
+// the failure is not the shadow case), (c) the fetched sibling links to a block
+// we already have (1-block gap only — deeper gaps stay on the rollback path),
+// (d) both inserts succeed. Returns true iff the batch re-imported; any miss
+// returns false so the caller falls back to maybeRollbackOnUnknownAncestor.
+func (s *xdcSyncer) adoptV2ShadowSibling(blocks types.Blocks, peer *eth.Peer) bool {
+	if len(blocks) == 0 || peer == nil {
+		return false
+	}
+	first := blocks[0]
+	cfg := s.handler.chain.Config()
+	if cfg == nil || cfg.XDPoS == nil || first.NumberU64() == 0 {
+		return false
+	}
+	parentNum := first.NumberU64() - 1
+	// V2 only — V1 forks are handled by adoptCoSignedSibling.
+	if cfg.XDPoS.V2 == nil || cfg.XDPoS.V2.SwitchBlock == nil ||
+		parentNum <= cfg.XDPoS.V2.SwitchBlock.Uint64() {
+		return false
+	}
+	parentHash := first.ParentHash()
+	// If we already have the batch's parent, the failure is not the missing
+	// shadow-sibling case — let the normal rollback path handle it.
+	if s.handler.chain.HasBlock(parentHash, parentNum) {
+		return false
+	}
+	// Fetch the QC'd sibling (the batch's missing parent) by hash from the same
+	// peer that served the batch — a by-hash request returns exactly that block.
+	hdr := s.fetchHeaderByHash(peer, parentHash)
+	if hdr == nil || hdr.Number == nil || hdr.Number.Uint64() != parentNum || hdr.Hash() != parentHash {
+		return false
+	}
+	// The sibling must link to a block we already have (the shared parent at
+	// H-1); otherwise this is a deeper gap that needs the rollback path.
+	if !s.handler.chain.HasBlock(hdr.ParentHash, parentNum-1) {
+		return false
+	}
+	bodies := s.fetchBodiesBatch(peer, []common.Hash{parentHash})
+	if len(bodies) == 0 {
+		return false
+	}
+	sib := s.buildBlocks([]*types.Header{hdr}, bodies)
+	if len(sib) != 1 {
+		return false
+	}
+	// Insert the QC'd sibling — full validation runs; the V2 QC-chain fork
+	// choice reorgs the shadow head onto the sibling's chain.
+	if _, err := s.handler.chain.InsertChain(sib); err != nil {
+		log.Debug("xdcSyncer: adopt V2 shadow sibling — sibling insert failed",
+			"number", parentNum, "hash", parentHash, "err", err)
+		return false
+	}
+	// Re-insert the original batch; it now extends the canonical chain.
+	if _, err := s.handler.chain.InsertChain(blocks); err != nil {
+		log.Warn("xdcSyncer: adopt V2 shadow sibling — batch re-insert failed",
+			"from", first.NumberU64(), "err", err)
+		return false
+	}
+	log.Info("xdcSyncer: adopted V2 QC'd sibling (shadow fork healed)",
 		"siblingNum", parentNum, "siblingHash", parentHash,
 		"newHead", s.handler.chain.CurrentBlock().Number.Uint64())
 	// Back on canonical — clear fork-recovery so the miner can resume sealing.
