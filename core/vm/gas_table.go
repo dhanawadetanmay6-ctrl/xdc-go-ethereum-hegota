@@ -21,6 +21,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -713,6 +714,14 @@ func gasSStore8037And8038(evm *EVM, contract *Contract, stack *Stack, mem *Memor
 	}
 	if original == current { // first change of the slot (2.1)
 		if original == (common.Hash{}) { // create slot (2.1.1)
+			// EIP-8141: journal the executing frame as the outstanding
+			// state-gas charge owner for (address, storage_key). A later
+			// frame clearing this slot refills the owner frame's receipt.
+			if fc := evm.frameCtx; fc != nil {
+				if sdb, fs := fc.frameDB(evm); fs != nil {
+					sdb.SetFrameStateGasOwner(contract.Address(), slot, fc.CurrentFrame)
+				}
+			}
 			return GasCosts{
 				RegularGas: access + params.StorageWriteAmsterdam,
 				StateGas:   stateSet,
@@ -732,7 +741,34 @@ func gasSStore8037And8038(evm *EVM, contract *Contract, stack *Stack, mem *Memor
 	}
 	if original == value { // reset to original value (2.2.2)
 		if original == (common.Hash{}) { // reset to original inexistent slot (2.2.2.1)
-			contract.Gas.RefundState(stateSet)
+			// EIP-8141 cross-frame refill: the refund goes to the frame that
+			// paid the outstanding creation charge. If that is the current
+			// frame, the refill is spendable (credited to state_gas_left);
+			// if it is an earlier frame, the owner frame's receipt is
+			// reduced (settlement refunds the payer) and no spendable gas
+			// crosses the frame boundary.
+			fc := evm.frameCtx
+			sdb, fs := frameStateDB(nil), (*state.FrameState)(nil)
+			if fc != nil {
+				sdb, fs = fc.frameDB(evm)
+			}
+			if fs == nil {
+				contract.Gas.RefundState(stateSet)
+			} else {
+				owner, recorded := sdb.FrameStateGasOwner(contract.Address(), slot)
+				switch {
+				case !recorded || owner == fc.CurrentFrame:
+					contract.Gas.RefundState(stateSet)
+				default:
+					// Owner is an earlier frame: reduce its receipt only.
+					// The journaled value may be further reduced by later
+					// refills; each ownership entry fires at most once.
+					if owner < len(fs.ReceiptStateGas) {
+						sdb.SetFrameReceiptStateGas(owner, fs.ReceiptStateGas[owner]-int64(stateSet))
+					}
+				}
+				sdb.ClearFrameStateGasOwner(contract.Address(), slot)
+			}
 		}
 		evm.StateDB.AddRefund(params.StorageWriteAmsterdam)
 	}

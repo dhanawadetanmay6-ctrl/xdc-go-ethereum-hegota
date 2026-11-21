@@ -1084,10 +1084,16 @@ type RPCTransaction struct {
 	ChainID             *hexutil.Big                 `json:"chainId,omitempty"`
 	BlobVersionedHashes []common.Hash                `json:"blobVersionedHashes,omitempty"`
 	AuthorizationList   []types.SetCodeAuthorization `json:"authorizationList,omitempty"`
-	V                   *hexutil.Big                 `json:"v"`
-	R                   *hexutil.Big                 `json:"r"`
-	S                   *hexutil.Big                 `json:"s"`
-	YParity             *hexutil.Uint64              `json:"yParity,omitempty"`
+	// EIP-8141 frame transaction fields:
+	Sender     *common.Address        `json:"sender,omitempty"`
+	Frames     []types.Frame          `json:"frames,omitempty"`
+	Signatures []types.FrameSignature `json:"signatures,omitempty"`
+	MaxFee     *hexutil.Big           `json:"maxFee,omitempty"`
+	BlobGas    *hexutil.Uint64        `json:"blobGas,omitempty"`
+	V          *hexutil.Big           `json:"v"`
+	R          *hexutil.Big           `json:"r"`
+	S          *hexutil.Big           `json:"s"`
+	YParity    *hexutil.Uint64        `json:"yParity,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
@@ -1179,6 +1185,22 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 			result.GasPrice = (*hexutil.Big)(tx.GasFeeCap())
 		}
 		result.AuthorizationList = tx.SetCodeAuthorizations()
+
+	case types.FrameTxType:
+		// EIP-8141: no outer signature (V/R/S stay zero), no top-level
+		// to/value/input. The frame list and signature entries carry the
+		// payload; max_fee is the total fee budget; gasPrice is the
+		// protocol-computed per-gas price of the inclusion block.
+		ft := tx.FrameTxData()
+		result.ChainID = (*hexutil.Big)(tx.ChainId())
+		result.Sender = &ft.Sender
+		result.Frames = ft.Frames
+		result.Signatures = ft.Signatures
+		result.MaxFee = (*hexutil.Big)(ft.Fees.MaxFee.ToBig())
+		result.GasTipCap = (*hexutil.Big)(ft.Fees.MaxPriorityFeePerGas.ToBig())
+		result.BlobVersionedHashes = ft.BlobHashes
+		blobGas := hexutil.Uint64(tx.BlobGas())
+		result.BlobGas = &blobGas
 	}
 	return result
 }
@@ -1614,6 +1636,28 @@ func MarshalReceipt(receipt *types.Receipt, blockHash common.Hash, blockNumber u
 	if tx.Type() == types.BlobTxType {
 		fields["blobGasUsed"] = hexutil.Uint64(receipt.BlobGasUsed)
 		fields["blobGasPrice"] = (*hexutil.Big)(receipt.BlobGasPrice)
+	}
+
+	// EIP-8141 frame transaction receipts expose the payer and the per-frame
+	// receipt entries. The top-level "logs" field remains the union of all
+	// frame logs for filter compatibility.
+	if tx.Type() == types.FrameTxType {
+		fields["payer"] = receipt.Payer
+		frames := make([]map[string]interface{}, len(receipt.FrameReceipts))
+		for i, fr := range receipt.FrameReceipts {
+			logs := fr.Logs
+			if logs == nil {
+				logs = []*types.Log{}
+			}
+			frames[i] = map[string]interface{}{
+				"frameIndex":       hexutil.Uint64(i),
+				"status":           hexutil.Uint64(fr.Status),
+				"gasUsedExecution": hexutil.Uint64(fr.GasUsedExecution),
+				"gasUsedState":     hexutil.Uint64(fr.GasUsedState),
+				"logs":             logs,
+			}
+		}
+		fields["frameReceipts"] = frames
 	}
 
 	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation

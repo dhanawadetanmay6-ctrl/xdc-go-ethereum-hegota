@@ -145,6 +145,7 @@ func validate(jt JumpTable) JumpTable {
 
 func newBogotaInstructionSet() JumpTable {
 	instructionSet := newAmsterdamInstructionSet()
+	enable8141(&instructionSet) // EIP-8141 (frame transactions)
 	return validate(instructionSet)
 }
 

@@ -212,6 +212,8 @@ func (tx *Transaction) decodeTyped(b []byte) (TxData, error) {
 		inner = new(BlobTx)
 	case SetCodeTxType:
 		inner = new(SetCodeTx)
+	case FrameTxType:
+		inner = new(FrameTx)
 	default:
 		return nil, ErrTxTypeNotSupported
 	}
@@ -317,6 +319,14 @@ func (tx *Transaction) To() *common.Address {
 
 // Cost returns (gas * gasPrice) + (blobGas * blobGasPrice) + value.
 func (tx *Transaction) Cost() *big.Int {
+	// EIP-8141 frame transactions: worst-case cost is the total fee budget
+	// (max_fee covers both execution and blob gas) plus the sum of frame
+	// values (frame value transfers are sourced from the sender only).
+	if ft := tx.FrameTxData(); ft != nil {
+		total := new(big.Int).Set(ft.Fees.MaxFee.ToBig())
+		total.Add(total, tx.inner.value())
+		return total
+	}
 	// Avoid allocating copies via tx.GasPrice()/tx.Value(); use inner values directly.
 	total := new(big.Int).SetUint64(tx.inner.gas())
 	total.Mul(total, tx.inner.gasPrice())

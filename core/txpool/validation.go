@@ -84,6 +84,11 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 	if !rules.IsPrague && tx.Type() == types.SetCodeTxType {
 		return fmt.Errorf("%w: type %d rejected, pool not yet in Prague", core.ErrTxTypeNotSupported, tx.Type())
 	}
+	// EIP-8141 frame transactions have their own validation model; the
+	// legacy intrinsic/floor/fee-cap checks below do not apply to them.
+	if tx.Type() == types.FrameTxType {
+		return validateFrameTransaction(tx, head, opts, rules)
+	}
 	// Check whether the init code size has been exceeded
 	if tx.To() == nil {
 		if err := vm.CheckMaxInitCodeSize(&rules, uint64(len(tx.Data()))); err != nil {
@@ -186,6 +191,77 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 		if len(tx.SetCodeAuthorizations()) == 0 {
 			return errors.New("set code tx must have at least one authorization tuple")
 		}
+	}
+	return nil
+}
+
+// validateFrameTransaction performs the stateless validation of an EIP-8141
+// frame transaction for pool admission.
+//
+// Deliberately conservative deviations from the EIP-8141 public-mempool
+// policy (see FRAME_TRANSACTIONS_IMPLEMENTATION.md): no validation-prefix
+// simulation is run here, and blob-carrying frame transactions are rejected
+// until blobpool support exists. Both are safe admission-side restrictions:
+// they can only reject transactions that a full policy might admit, never
+// accept invalid ones. State-dependent checks (nonce, worst-case funds) are
+// done by ValidateTransactionWithState; affordability uses the conservative
+// sender-pays-everything bound via Transaction.Cost.
+func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *ValidationOptions, rules params.Rules) error {
+	if !rules.IsBogota {
+		return fmt.Errorf("%w: type %d rejected, pool not yet in Bogota", core.ErrTxTypeNotSupported, tx.Type())
+	}
+	ft := tx.FrameTxData()
+	if ft == nil {
+		return errors.New("frame transaction payload missing")
+	}
+	// Chain binding.
+	if ft.ChainID == nil || ft.ChainID.ToBig().Cmp(opts.Config.ChainID) != 0 {
+		return fmt.Errorf("%w: frame tx chain id mismatch", ErrInvalidSender)
+	}
+	// Structural constraints (frame modes, flags, batch structure, expiry
+	// frames, EIP-7825 cap, blob hash versioning).
+	if err := ft.ValidateStatic(); err != nil {
+		return err
+	}
+	// Blob-carrying frame transactions need blobpool support; not implemented.
+	if len(ft.BlobHashes) > 0 {
+		return errors.New("blob-carrying frame transactions not supported by txpool")
+	}
+	// Protocol-validated signatures must verify before any execution; check
+	// them at admission (stateless) so invalid transactions never enter.
+	if _, err := ft.ValidateSignatures(); err != nil {
+		return err
+	}
+	// EIP-2681 nonce overflow.
+	if ft.Nonce+1 < ft.Nonce {
+		return core.ErrNonceMax
+	}
+	// Block gas limit: the 2D execution reservation must fit the block. The
+	// execution-dimension reservation is max(intrinsic + sum(execution),
+	// calldata_floor_gas), matching block-inclusion rules (EIP-8141).
+	intrinsic, floor, err := ft.IntrinsicGas()
+	if err != nil {
+		return err
+	}
+	execReservation := intrinsic
+	for _, frame := range ft.Frames {
+		execReservation += frame.Limits.Execution
+	}
+	if max(execReservation, floor) > head.GasLimit {
+		return ErrGasLimit
+	}
+	// Fee sanity: extremely large fields and pool minimum tip.
+	if ft.Fees.MaxFee == nil || ft.Fees.MaxPriorityFeePerGas == nil {
+		return core.ErrFeeCapVeryHigh
+	}
+	if !ft.Fees.MaxFee.IsUint64() && ft.Fees.MaxFee.BitLen() > 256 {
+		return core.ErrFeeCapVeryHigh
+	}
+	if ft.Fees.MaxPriorityFeePerGas.BitLen() > 256 {
+		return core.ErrTipVeryHigh
+	}
+	if opts.MinTip != nil && ft.Fees.MaxPriorityFeePerGas.ToBig().Cmp(opts.MinTip) < 0 {
+		return fmt.Errorf("%w: max priority fee per gas %v, minimum needed %v", ErrTxGasPriceTooLow, ft.Fees.MaxPriorityFeePerGas, opts.MinTip)
 	}
 	return nil
 }

@@ -41,6 +41,8 @@ type sigCache struct {
 func MakeSigner(config *params.ChainConfig, blockNumber *big.Int, blockTime uint64) Signer {
 	var signer Signer
 	switch {
+	case config.IsBogota(blockNumber, blockTime):
+		signer = NewBogotaSigner(config.ChainID)
 	case config.IsPrague(blockNumber, blockTime):
 		signer = NewPragueSigner(config.ChainID)
 	case config.IsCancun(blockNumber, blockTime):
@@ -70,6 +72,8 @@ func LatestSigner(config *params.ChainConfig) Signer {
 	var signer Signer
 	if config.ChainID != nil {
 		switch {
+		case config.BogotaTime != nil:
+			signer = NewBogotaSigner(config.ChainID)
 		case config.PragueTime != nil:
 			signer = NewPragueSigner(config.ChainID)
 		case config.CancunTime != nil:
@@ -99,7 +103,7 @@ func LatestSigner(config *params.ChainConfig) Signer {
 func LatestSignerForChainID(chainID *big.Int) Signer {
 	var signer Signer
 	if chainID != nil {
-		signer = NewPragueSigner(chainID)
+		signer = NewBogotaSigner(chainID)
 	} else {
 		signer = HomesteadSigner{}
 	}
@@ -129,6 +133,48 @@ func MustSignNewTx(prv *ecdsa.PrivateKey, s Signer, txdata TxData) *Transaction 
 		panic(err)
 	}
 	return tx
+}
+
+// SignFrameTx signs the canonical signature hash of a frame transaction with
+// the given secp256k1 key and installs a SECP256K1 signature entry with empty
+// signer metadata (resolving to tx.Sender) and empty msg.
+//
+// The entry is placed at index 0, replacing an existing SECP256K1 empty-msg
+// entry there: the default validation code for VERIFY frames inspects index 0
+// for the execution-and-payment approval signature (EIP-8141 "Default code").
+//
+// Because compute_sig_hash commits to the byte LENGTH of every empty-msg
+// signature entry, the final list must already carry entries of their final
+// lengths before signing; this helper preserves the invariant by signing only
+// after the 65-byte placeholder slot exists.
+func SignFrameTx(prv *ecdsa.PrivateKey, tx *Transaction) (*Transaction, error) {
+	frametx, ok := tx.inner.(*FrameTx)
+	if !ok {
+		return nil, ErrTxTypeNotSupported
+	}
+	cpy := frametx.copy().(*FrameTx)
+	placeholder := FrameSignature{Scheme: FrameSigSchemeSecp256k1, Signature: make([]byte, 65)}
+	if len(cpy.Signatures) > 0 && cpy.Signatures[0].Scheme == FrameSigSchemeSecp256k1 && len(cpy.Signatures[0].Msg) == 0 {
+		if len(cpy.Signatures[0].Signature) != 65 {
+			return nil, errors.New("existing secp256k1 entry at index 0 has non-standard length")
+		}
+		cpy.Signatures[0] = placeholder
+	} else {
+		cpy.Signatures = append([]FrameSignature{placeholder}, cpy.Signatures...)
+	}
+	sig, err := crypto.Sign(cpy.SigHash().Bytes(), prv)
+	if err != nil {
+		return nil, err
+	}
+	entry := FrameSignature{
+		Scheme:    FrameSigSchemeSecp256k1,
+		Signature: append([]byte{sig[64]}, sig[:64]...),
+	}
+	cpy.Signatures[0] = entry
+	out := NewTx(cpy)
+	// Preserve the original discovery time for pool-ordering continuity.
+	out.time = tx.time
+	return out, nil
 }
 
 // Sender returns the address derived from the signature (V, R, S) using secp256k1
@@ -231,6 +277,9 @@ func newModernSigner(chainID *big.Int, fork forks.Fork) Signer {
 	if fork >= forks.Prague {
 		s.txtypes.set(SetCodeTxType)
 	}
+	if fork >= forks.Bogota {
+		s.txtypes.set(FrameTxType)
+	}
 	return s
 }
 
@@ -262,6 +311,16 @@ func (s *modernSigner) Sender(tx *Transaction) (common.Address, error) {
 	if tx.ChainId().Cmp(s.chainID) != 0 {
 		return common.Address{}, fmt.Errorf("%w: have %d want %d", ErrInvalidChainId, tx.ChainId(), s.chainID)
 	}
+	if tt == FrameTxType {
+		// Frame transactions (EIP-8141) carry no outer ECDSA signature: the
+		// sender is an explicit envelope field, authenticated in-protocol by
+		// VERIFY frames and APPROVE during execution.
+		frametx, ok := tx.inner.(*FrameTx)
+		if !ok {
+			return common.Address{}, ErrTxTypeNotSupported
+		}
+		return frametx.Sender, nil
+	}
 	// 'modern' txs are defined to use 0 and 1 as their recovery
 	// id, add 27 to become equivalent to unprotected Homestead signatures.
 	V, R, S := tx.RawSignatureValues()
@@ -277,6 +336,11 @@ func (s *modernSigner) SignatureValues(tx *Transaction, sig []byte) (R, S, V *bi
 	if tt == LegacyTxType {
 		return s.legacy.SignatureValues(tx, sig)
 	}
+	if tt == FrameTxType {
+		// Frame transactions carry no outer signature; signing produces
+		// entries for the Signatures list instead (see SignFrameTx).
+		return nil, nil, nil, errors.New("frame transactions have no outer signature")
+	}
 	// Check that chain ID of tx matches the signer. We also accept ID zero here,
 	// because it indicates that the chain ID was not specified in the tx.
 	if tx.inner.chainID().Sign() != 0 && tx.inner.chainID().Cmp(s.chainID) != 0 {
@@ -288,6 +352,18 @@ func (s *modernSigner) SignatureValues(tx *Transaction, sig []byte) (R, S, V *bi
 	}
 	V = big.NewInt(int64(sig[64]))
 	return R, S, V, nil
+}
+
+// NewBogotaSigner returns a signer that additionally accepts
+// - EIP-8141 frame transactions,
+// - EIP-7702 set code transactions,
+// - EIP-4844 blob transactions,
+// - EIP-1559 dynamic fee transactions,
+// - EIP-2930 access list transactions,
+// - EIP-155 replay protected transactions, and
+// - legacy Homestead transactions.
+func NewBogotaSigner(chainId *big.Int) Signer {
+	return newModernSigner(chainId, forks.Bogota)
 }
 
 // NewPragueSigner returns a signer that accepts

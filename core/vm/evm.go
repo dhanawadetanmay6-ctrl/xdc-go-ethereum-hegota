@@ -130,6 +130,11 @@ type EVM struct {
 	readOnly   bool   // Whether to throw on stateful modifications
 	returnData []byte // Last CALL's return data for subsequent reuse
 
+	// frameCtx is non-nil only while an EIP-8141 frame transaction executes.
+	// The frame opcodes (APPROVE, TXPARAM, ...) halt exceptionally when it is
+	// nil.
+	frameCtx *FrameTxContext
+
 	arena *stackArena
 }
 
@@ -253,6 +258,19 @@ func (evm *EVM) SetTxContext(txCtx TxContext) {
 		txCtx.AccessEvents = state.NewAccessEvents()
 	}
 	evm.TxContext = txCtx
+}
+
+// SetFrameContext attaches (or detaches, with nil) the EIP-8141 frame
+// transaction execution context. Called only by the frame transition engine
+// at transaction boundaries.
+func (evm *EVM) SetFrameContext(fc *FrameTxContext) {
+	evm.frameCtx = fc
+}
+
+// FrameContext returns the frame transaction execution context, or nil when
+// the current transaction is not a frame transaction.
+func (evm *EVM) FrameContext() *FrameTxContext {
+	return evm.frameCtx
 }
 
 // Cancel cancels any running EVM operation. This may be called concurrently and

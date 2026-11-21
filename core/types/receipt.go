@@ -59,6 +59,12 @@ type Receipt struct {
 	Bloom             Bloom  `json:"logsBloom"         gencodec:"required"`
 	Logs              []*Log `json:"logs"              gencodec:"required"`
 
+	// EIP-8141 frame transaction consensus fields (frame receipt encoding:
+	// [cumulative_gas_used, payer, [[status, [exec, state], logs]...]]).
+	// Payer and FrameReceipts are nil for all other transaction types.
+	Payer         common.Address `json:"payer,omitempty"`
+	FrameReceipts []*FrameReceipt `json:"frameReceipts,omitempty"`
+
 	// Implementation fields: These fields are added by geth when processing a transaction.
 	TxHash            common.Hash    `json:"transactionHash" gencodec:"required"`
 	ContractAddress   common.Address `json:"contractAddress"`
@@ -102,6 +108,70 @@ type storedReceiptRLP struct {
 	Logs              []*Log
 }
 
+// frameReceiptRLP is the consensus encoding of an EIP-8141 frame transaction
+// receipt: [cumulative_gas_used, payer, frame_receipts].
+type frameReceiptRLP struct {
+	CumulativeGasUsed uint64
+	Payer             common.Address
+	Frames            []*frameReceiptEntryRLP
+}
+
+// frameReceiptEntryRLP is the consensus encoding of one frame receipt entry:
+// [status, [execution_gas_used, state_gas_used], logs].
+type frameReceiptEntryRLP struct {
+	Status  uint8
+	GasUsed []uint64 // [execution, state]
+	Logs    []*Log
+}
+
+// frameReceiptRLP converts the receipt into its EIP-8141 consensus encoding
+// representation.
+func (r *Receipt) frameReceiptRLP() *frameReceiptRLP {
+	frames := make([]*frameReceiptEntryRLP, len(r.FrameReceipts))
+	for i, fr := range r.FrameReceipts {
+		frames[i] = &frameReceiptEntryRLP{
+			Status:  fr.Status,
+			GasUsed: []uint64{fr.GasUsedExecution, fr.GasUsedState},
+			Logs:    fr.Logs,
+		}
+	}
+	return &frameReceiptRLP{
+		CumulativeGasUsed: r.CumulativeGasUsed,
+		Payer:             r.Payer,
+		Frames:            frames,
+	}
+}
+
+// MarshalFramePayload returns the EIP-8141 consensus payload of the receipt
+// (the RLP list [cumulative_gas_used, payer, frames], without the 0x06 type
+// byte). It is used by the eth protocol layer to carry frame receipts on the
+// wire inside the eth/69 compressed receipt shape.
+func (r *Receipt) MarshalFramePayload() ([]byte, error) {
+	return rlp.EncodeToBytes(r.frameReceiptRLP())
+}
+
+// setFromFrameRLP loads the EIP-8141 consensus encoding into the receipt.
+func (r *Receipt) setFromFrameRLP(data frameReceiptRLP) error {
+	r.CumulativeGasUsed = data.CumulativeGasUsed
+	r.Payer = data.Payer
+	r.FrameReceipts = make([]*FrameReceipt, len(data.Frames))
+	for i, fr := range data.Frames {
+		if len(fr.GasUsed) != 2 {
+			return fmt.Errorf("invalid frame receipt gas pair length %d", len(fr.GasUsed))
+		}
+		if fr.Status > FrameStatusSkipped {
+			return fmt.Errorf("invalid frame receipt status %d", fr.Status)
+		}
+		r.FrameReceipts[i] = &FrameReceipt{
+			Status:           fr.Status,
+			GasUsedExecution: fr.GasUsed[0],
+			GasUsedState:     fr.GasUsed[1],
+			Logs:             fr.Logs,
+		}
+	}
+	return nil
+}
+
 // NewReceipt creates a barebone transaction receipt, copying the init fields.
 // Deprecated: create receipts using a struct literal instead.
 func NewReceipt(root []byte, failed bool, cumulativeGasUsed uint64) *Receipt {
@@ -121,6 +191,17 @@ func NewReceipt(root []byte, failed bool, cumulativeGasUsed uint64) *Receipt {
 // EncodeRLP implements rlp.Encoder, and flattens the consensus fields of a receipt
 // into an RLP stream. If no post state is present, byzantium fork is assumed.
 func (r *Receipt) EncodeRLP(w io.Writer) error {
+	if r.Type == FrameTxType {
+		// EIP-8141: [0x06 || rlp([cumulative_gas_used, payer, frames])]
+		buf := encodeBufferPool.Get().(*bytes.Buffer)
+		defer encodeBufferPool.Put(buf)
+		buf.Reset()
+		buf.WriteByte(FrameTxType)
+		if err := rlp.Encode(buf, r.frameReceiptRLP()); err != nil {
+			return err
+		}
+		return rlp.Encode(w, buf.Bytes())
+	}
 	data := &receiptRLP{r.statusEncoding(), r.CumulativeGasUsed, r.Bloom, r.Logs}
 	if r.Type == LegacyTxType {
 		return rlp.Encode(w, data)
@@ -142,6 +223,14 @@ func (r *Receipt) encodeTyped(data *receiptRLP, w *bytes.Buffer) error {
 
 // MarshalBinary returns the consensus encoding of the receipt.
 func (r *Receipt) MarshalBinary() ([]byte, error) {
+	if r.Type == FrameTxType {
+		var buf bytes.Buffer
+		buf.WriteByte(FrameTxType)
+		if err := rlp.Encode(&buf, r.frameReceiptRLP()); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
 	if r.Type == LegacyTxType {
 		return rlp.EncodeToBytes(r)
 	}
@@ -205,6 +294,13 @@ func (r *Receipt) decodeTyped(b []byte) error {
 		return errShortTypedReceipt
 	}
 	switch b[0] {
+	case FrameTxType:
+		var data frameReceiptRLP
+		if err := rlp.DecodeBytes(b[1:], &data); err != nil {
+			return err
+		}
+		r.Type = b[0]
+		return r.setFromFrameRLP(data)
 	case DynamicFeeTxType, AccessListTxType, BlobTxType, SetCodeTxType:
 		var data receiptRLP
 		err := rlp.DecodeBytes(b[1:], &data)
@@ -292,12 +388,27 @@ func (r *Receipt) DeriveFields(signer Signer, context DeriveReceiptContext) {
 	r.TransactionIndex = context.TxIndex
 
 	// The contract address can be derived from the transaction itself
-	if context.Tx.To() == nil {
+	if context.Tx.To() == nil && r.Type != FrameTxType {
 		// Deriving the signer is expensive, only do if it's actually needed
 		from, _ := Sender(signer, context.Tx)
 		r.ContractAddress = crypto.CreateAddress(from, context.Tx.Nonce())
 	} else {
 		r.ContractAddress = common.Address{}
+	}
+	// EIP-8141: frame receipts hold their logs per frame; rebuild the union
+	// list (used for bloom filtering and the RPC logs field) before deriving.
+	if r.Type == FrameTxType && r.Logs == nil && r.FrameReceipts != nil {
+		for _, fr := range r.FrameReceipts {
+			r.Logs = append(r.Logs, fr.Logs...)
+		}
+		// Derive the top-level status from the frame receipts.
+		r.Status = ReceiptStatusFailed
+		for _, fr := range r.FrameReceipts {
+			if fr.Status == FrameStatusSucceeded {
+				r.Status = ReceiptStatusSuccessful
+				break
+			}
+		}
 	}
 	// The derived log fields can simply be set from the block and transaction
 	logIndex := context.LogIndex
@@ -322,6 +433,23 @@ type ReceiptForStorage Receipt
 // into an RLP stream.
 func (r *ReceiptForStorage) EncodeRLP(_w io.Writer) error {
 	w := rlp.NewEncoderBuffer(_w)
+	if r.Type == FrameTxType {
+		// EIP-8141 frame receipts persist [status, cumulative, payload] where
+		// payload is the full consensus encoding body (rlp of [cumulative,
+		// payer, frames]). This shape is deliberately wire-compatible with the
+		// eth/69 compressed receipt format: stripping or re-adding the type
+		// byte converts between storage and network forms without re-encoding.
+		payload, err := (*Receipt)(r).MarshalFramePayload()
+		if err != nil {
+			return err
+		}
+		outerList := w.List()
+		w.WriteBytes((*Receipt)(r).statusEncoding())
+		w.WriteUint64(r.CumulativeGasUsed)
+		w.Write(payload)
+		w.ListEnd(outerList)
+		return w.Flush()
+	}
 	outerList := w.List()
 	w.WriteBytes((*Receipt)(r).statusEncoding())
 	w.WriteUint64(r.CumulativeGasUsed)
@@ -338,18 +466,65 @@ func (r *ReceiptForStorage) EncodeRLP(_w io.Writer) error {
 
 // DecodeRLP implements rlp.Decoder, and loads both consensus and implementation
 // fields of a receipt from an RLP stream.
+//
+// The frame-receipt storage form is [status, cumulative, payload] with the
+// consensus payload as the third element. Both legacy logs and the frame
+// payload are RLP lists; they are discriminated by content: a legacy logs
+// list is empty or starts with a log (a list), while the frame payload
+// [cumulative, payer, frames] is never empty and starts with an integer
+// (a string).
 func (r *ReceiptForStorage) DecodeRLP(s *rlp.Stream) error {
-	var stored storedReceiptRLP
-	if err := s.Decode(&stored); err != nil {
+	if _, err := s.List(); err != nil {
 		return err
 	}
-	if err := (*Receipt)(r).setStatus(stored.PostStateOrStatus); err != nil {
+	var statusB []byte
+	if err := s.Decode(&statusB); err != nil {
 		return err
 	}
-	r.CumulativeGasUsed = stored.CumulativeGasUsed
-	r.Logs = stored.Logs
+	var cumulative uint64
+	if err := s.Decode(&cumulative); err != nil {
+		return err
+	}
+	var third rlp.RawValue
+	if err := s.Decode(&third); err != nil {
+		return err
+	}
+	if err := s.ListEnd(); err != nil {
+		return err
+	}
+	if err := (*Receipt)(r).setStatus(statusB); err != nil {
+		return err
+	}
+	r.CumulativeGasUsed = cumulative
 
-	return nil
+	content, _, err := rlp.SplitList(third)
+	if err != nil {
+		return fmt.Errorf("invalid receipt logs/payload: %v", err)
+	}
+	framePayload := false
+	if len(content) > 0 {
+		kind, _, _, err := rlp.Split(content)
+		if err != nil {
+			return fmt.Errorf("invalid receipt third element: %v", err)
+		}
+		framePayload = kind == rlp.String
+	}
+	if !framePayload {
+		// Legacy entry: [status, cumulative, logs].
+		var logs []*Log
+		if err := rlp.DecodeBytes(third, &logs); err != nil {
+			return err
+		}
+		r.Logs = logs
+		return nil
+	}
+	// EIP-8141 frame entry.
+	var data frameReceiptRLP
+	if err := rlp.DecodeBytes(third, &data); err != nil {
+		return err
+	}
+	r.Type = FrameTxType
+	return (*Receipt)(r).setFromFrameRLP(data)
 }
 
 // Receipts implements DerivableList for receipts.
@@ -361,6 +536,11 @@ func (rs Receipts) Len() int { return len(rs) }
 // EncodeIndex encodes the i'th receipt to w.
 func (rs Receipts) EncodeIndex(i int, w *bytes.Buffer) {
 	r := rs[i]
+	if r.Type == FrameTxType {
+		w.WriteByte(r.Type)
+		rlp.Encode(w, r.frameReceiptRLP())
+		return
+	}
 	data := &receiptRLP{r.statusEncoding(), r.CumulativeGasUsed, r.Bloom, r.Logs}
 	if r.Type == LegacyTxType {
 		rlp.Encode(w, data)

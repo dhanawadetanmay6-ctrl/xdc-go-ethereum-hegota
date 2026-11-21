@@ -58,12 +58,24 @@ type GasBudget struct {
 	// has been borrowed to cover state-gas charges that exceeded the
 	// reservoir.
 	Spilled uint64
+
+	// NoSpill disables the EIP-8037 spillover: state-gas charges draw only
+	// from StateGas, never from RegularGas. This is the EIP-8141 frame-tx
+	// mode: the two frame gas pools are independent and execution gas can
+	// never be spent on state charges.
+	NoSpill bool
 }
 
 // NewGasBudget initializes a fresh GasBudget for execution / forwarding,
 // with both usage accumulators set to zero.
 func NewGasBudget(regular, state uint64) GasBudget {
 	return GasBudget{RegularGas: regular, StateGas: state}
+}
+
+// NewGasBudgetNoSpill initializes a GasBudget with strict pool separation
+// (EIP-8141 frame transactions).
+func NewGasBudgetNoSpill(regular, state uint64) GasBudget {
+	return GasBudget{RegularGas: regular, StateGas: state, NoSpill: true}
 }
 
 // Used returns the total scalar gas consumed relative to an initial budget.
@@ -103,6 +115,9 @@ func (g GasBudget) CanAfford(cost GasCosts) bool {
 	}
 	regular := g.RegularGas - cost.RegularGas
 	if cost.StateGas > g.StateGas {
+		if g.NoSpill {
+			return false
+		}
 		return cost.StateGas-g.StateGas <= regular
 	}
 	return true
@@ -118,6 +133,10 @@ func (g *GasBudget) charge(cost GasCosts) bool {
 	spilled := g.Spilled
 
 	if cost.StateGas > state {
+		if g.NoSpill {
+			// EIP-8141: state charges can never draw from execution gas.
+			return false
+		}
 		spillover := cost.StateGas - state
 		if spillover > regular {
 			return false
@@ -182,6 +201,7 @@ func (g *GasBudget) Forward(regular uint64) GasBudget {
 	child := GasBudget{
 		RegularGas: regular,
 		StateGas:   g.StateGas,
+		NoSpill:    g.NoSpill,
 	}
 	g.StateGas = 0
 	return child

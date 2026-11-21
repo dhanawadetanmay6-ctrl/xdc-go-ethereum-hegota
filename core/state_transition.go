@@ -39,6 +39,10 @@ type ExecutionResult struct {
 	MaxUsedGas uint64 // Maximum gas consumed during execution, excluding gas refunds.
 	Err        error  // Any error encountered during the execution(listed in core/vm/errors.go)
 	ReturnData []byte // Returned data from evm(function result or data supplied with revert opcode)
+
+	// EIP-8141 frame transaction results (nil/zero for other tx types).
+	Payer         common.Address       // account that approved payment
+	FrameReceipts []*types.FrameReceipt // per-frame receipts
 }
 
 // Unwrap returns the internal evm error which allows us for further
@@ -295,6 +299,11 @@ type Message struct {
 	// - From is not verified to be an EOA
 	// - GasLimit is not checked against the protocol defined tx gaslimit
 	SkipTransactionChecks bool
+
+	// FrameTx, when non-nil, marks this message as an EIP-8141 frame
+	// transaction. The frame engine consumes it; all single-call fields
+	// (To, Value, Data, GasFeeCap, ...) are unused for frame transactions.
+	FrameTx *types.FrameTx
 }
 
 // TransactionToMessage converts a transaction into a Message.
@@ -345,6 +354,17 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 		SkipTransactionChecks: false,
 		BlobHashes:            tx.BlobHashes(),
 		BlobGasFeeCap:         blobGasFeeCap,
+	}
+	// EIP-8141 frame transactions carry their execution model in FrameTx; the
+	// generic fee fields above are placeholders (frame fee semantics differ),
+	// and the frame engine recomputes gas pricing from the block context.
+	if tx.Type() == types.FrameTxType {
+		msg.FrameTx = tx.FrameTxData()
+		msg.GasPrice = new(uint256.Int)
+		msg.GasFeeCap = new(uint256.Int)
+		msg.GasTipCap = new(uint256.Int)
+		msg.Value = new(uint256.Int)
+		msg.BlobGasFeeCap = new(uint256.Int)
 	}
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
 	if baseFee != nil {
@@ -708,6 +728,10 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		contractCreation = msg.To == nil
 		floorDataGas     uint64
 	)
+	// EIP-8141 frame transactions run their own transition path.
+	if msg.FrameTx != nil {
+		return st.executeFrameTx(rules)
+	}
 	// Validate the message and pre-pay gas.
 	if err := st.preCheck(rules); err != nil {
 		return nil, err

@@ -54,6 +54,13 @@ type txJSON struct {
 	Commitments []kzg4844.Commitment `json:"commitments,omitempty"`
 	Proofs      []kzg4844.Proof      `json:"proofs,omitempty"`
 
+	// Frame transaction (EIP-8141) fields:
+	Sender     *common.Address  `json:"sender,omitempty"`
+	Frames     []Frame          `json:"frames,omitempty"`
+	Signatures []FrameSignature `json:"signatures,omitempty"`
+	MaxFee     *hexutil.Big     `json:"maxFee,omitempty"`
+	BlobGas    *hexutil.Uint64  `json:"blobGas,omitempty"`
+
 	// Only used for encoding:
 	Hash common.Hash `json:"hash"`
 }
@@ -170,6 +177,21 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		enc.S = (*hexutil.Big)(itx.S.ToBig())
 		yparity := itx.V.Uint64()
 		enc.YParity = (*hexutil.Uint64)(&yparity)
+
+	case *FrameTx:
+		// EIP-8141: frame transactions have no outer ECDSA signature, no
+		// top-level to/value/input/gas. The frame list, signature entries and
+		// the total-budget fee fields carry the payload.
+		enc.ChainID = (*hexutil.Big)(itx.ChainID.ToBig())
+		enc.Nonce = (*hexutil.Uint64)(&itx.Nonce)
+		enc.Sender = &itx.Sender
+		enc.Frames = itx.Frames
+		enc.Signatures = itx.Signatures
+		enc.MaxFee = (*hexutil.Big)(itx.Fees.MaxFee.ToBig())
+		enc.MaxPriorityFeePerGas = (*hexutil.Big)(itx.Fees.MaxPriorityFeePerGas.ToBig())
+		enc.BlobVersionedHashes = itx.BlobHashes
+		blobGas := hexutil.Uint64(itx.blobGas())
+		enc.BlobGas = &blobGas
 	}
 	return json.Marshal(&enc)
 }
@@ -508,6 +530,52 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 			if err := sanityCheckSignature(vbig, itx.R.ToBig(), itx.S.ToBig(), false); err != nil {
 				return err
 			}
+		}
+
+	case FrameTxType:
+		// EIP-8141 frame transaction.
+		var itx FrameTx
+		inner = &itx
+		if dec.ChainID == nil {
+			return errors.New("missing required field 'chainId' in transaction")
+		}
+		var overflow bool
+		itx.ChainID, overflow = uint256.FromBig(dec.ChainID.ToInt())
+		if overflow {
+			return errors.New("'chainId' value overflows uint256")
+		}
+		if dec.Nonce == nil {
+			return errors.New("missing required field 'nonce' in transaction")
+		}
+		itx.Nonce = uint64(*dec.Nonce)
+		if dec.Sender == nil {
+			return errors.New("missing required field 'sender' in transaction")
+		}
+		itx.Sender = *dec.Sender
+		if len(dec.Frames) == 0 {
+			return errors.New("frame transaction requires at least one frame")
+		}
+		itx.Frames = dec.Frames
+		itx.Signatures = dec.Signatures
+		if dec.MaxFee == nil {
+			return errors.New("missing required field 'maxFee' in transaction")
+		}
+		itx.Fees.MaxFee, overflow = uint256.FromBig(dec.MaxFee.ToInt())
+		if overflow {
+			return errors.New("'maxFee' value overflows uint256")
+		}
+		if dec.MaxPriorityFeePerGas == nil {
+			return errors.New("missing required field 'maxPriorityFeePerGas' in transaction")
+		}
+		itx.Fees.MaxPriorityFeePerGas, overflow = uint256.FromBig(dec.MaxPriorityFeePerGas.ToInt())
+		if overflow {
+			return errors.New("'maxPriorityFeePerGas' value overflows uint256")
+		}
+		if dec.BlobGas != nil && uint64(*dec.BlobGas) != itx.blobGas() {
+			return errors.New("'blobGas' does not match derived blob gas")
+		}
+		if dec.BlobVersionedHashes != nil {
+			itx.BlobHashes = dec.BlobVersionedHashes
 		}
 
 	default:

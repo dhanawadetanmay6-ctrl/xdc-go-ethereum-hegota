@@ -366,6 +366,22 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 	}
 	receipt.TxHash = tx.Hash()
 
+	// EIP-8141 frame transactions carry per-frame receipts; the transaction
+	// itself never fails as a whole at this point (invalid frame transactions
+	// surface as execution errors and never reach receipt construction).
+	// Derived status: successful if any frame succeeded.
+	if tx.Type() == types.FrameTxType {
+		receipt.Payer = result.Payer
+		receipt.FrameReceipts = result.FrameReceipts
+		receipt.Status = types.ReceiptStatusFailed
+		for _, fr := range result.FrameReceipts {
+			if fr.Status == vm.FrameStatusSucceeded {
+				receipt.Status = types.ReceiptStatusSuccessful
+				break
+			}
+		}
+	}
+
 	// GasUsed = max(tx_gas_used - gas_refund, calldata_floor_gas_cost), unchanged
 	// in the Amsterdam fork.
 	receipt.GasUsed = result.UsedGas
@@ -376,7 +392,7 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 	}
 
 	// If the transaction created a contract, store the creation address in the receipt.
-	if tx.To() == nil {
+	if tx.To() == nil && tx.Type() != types.FrameTxType {
 		receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
 	}
 

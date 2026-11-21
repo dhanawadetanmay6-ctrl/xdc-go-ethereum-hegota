@@ -600,7 +600,8 @@ func (pool *LegacyPool) ValidateTxBasics(tx *types.Transaction) error {
 			1<<types.LegacyTxType |
 			1<<types.AccessListTxType |
 			1<<types.DynamicFeeTxType |
-			1<<types.SetCodeTxType,
+			1<<types.SetCodeTxType |
+			1<<types.FrameTxType,
 		MaxSize: txMaxSize,
 		MinTip:  minTip,
 	}
@@ -696,6 +697,12 @@ func (pool *LegacyPool) checkDelegationLimit(tx *types.Transaction) error {
 // validateAuth verifies that the transaction complies with code authorization
 // restrictions brought by SetCode transaction type.
 func (pool *LegacyPool) validateAuth(tx *types.Transaction) error {
+	// EIP-8141 frame transactions: the sender may be a contract account (the
+	// AA case) whose code is validation logic, not an EIP-7702 delegation;
+	// delegation limits and SetCode authority checks do not apply.
+	if tx.Type() == types.FrameTxType {
+		return nil
+	}
 	// Allow at most one in-flight tx for delegated accounts or those with a
 	// pending authorization.
 	if err := pool.checkDelegationLimit(tx); err != nil {

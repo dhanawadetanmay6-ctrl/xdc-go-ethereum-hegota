@@ -138,6 +138,11 @@ type StateDB struct {
 	// Transient storage
 	transientStorage transientStorage
 
+	// frameState holds the EIP-8141 frame-transaction execution state while a
+	// frame transaction executes; nil for all other transactions. Mutations
+	// are journaled (see statedb_frame.go) so snapshots revert them.
+	frameState *FrameState
+
 	// Journal of state modifications. This is the backbone of
 	// Snapshot and RevertToSnapshot.
 	journal *journal
@@ -743,6 +748,11 @@ func (s *StateDB) Copy() *StateDB {
 		accessList:       s.accessList.Copy(),
 		transientStorage: s.transientStorage.Copy(),
 		journal:          s.journal.copy(),
+	}
+	if s.frameState != nil {
+		// Copies happen between transactions, when no frame state is live;
+		// copy defensively anyway to keep StateDB self-consistent.
+		state.frameState = s.frameState.copy()
 	}
 	if s.trie != nil {
 		state.trie = mustCopyTrie(s.trie)

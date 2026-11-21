@@ -42,12 +42,30 @@ func newReceipt(tr *types.Receipt) Receipt {
 	} else {
 		r.PostStateOrStatus = new(big.Int).SetUint64(tr.Status).Bytes()
 	}
+	if tr.Type == types.FrameTxType {
+		// EIP-8141: carry the full consensus payload in the logs slot; the
+		// compressed shape cannot represent payer/frames, and encodeForHash
+		// re-emits the payload verbatim.
+		payload, err := tr.MarshalFramePayload()
+		if err == nil {
+			r.Logs = payload
+		}
+		return r
+	}
 	r.Logs, _ = rlp.EncodeToBytes(tr.Logs)
 	return r
 }
 
 // encodeForHash encodes a receipt for the block receiptsRoot derivation.
 func (r *Receipt) encodeForHash(bloomBuf *[6]byte, out *bytes.Buffer) {
+	// EIP-8141 frame receipts: the logs slot carries the full consensus
+	// payload; emit type byte + payload verbatim (no bloom in the frame
+	// encoding).
+	if r.TxType == types.FrameTxType {
+		out.WriteByte(r.TxType)
+		out.Write(r.Logs)
+		return
+	}
 	// For typed receipts, add the tx type.
 	if r.TxType != 0 {
 		out.WriteByte(r.TxType)
