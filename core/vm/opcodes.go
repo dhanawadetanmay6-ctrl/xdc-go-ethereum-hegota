@@ -224,6 +224,12 @@ const (
 	SIGDATACOPY   OpCode = 0xb5
 )
 
+// 0xb6-0xb7 - EIP-7906 transaction assertion ops (ASSERT frames only).
+const (
+	TXTRACE       OpCode = 0xb6
+	EVENTDATACOPY OpCode = 0xb7
+)
+
 // 0xd0 range - eof operations.
 const (
 	DATALOAD  OpCode = 0xd0
@@ -437,6 +443,8 @@ var opCodeToString = [256]string{
 	FRAMEPARAM:    "FRAMEPARAM",
 	SIGPARAM:      "SIGPARAM",
 	SIGDATACOPY:   "SIGDATACOPY",
+	TXTRACE:       "TXTRACE",
+	EVENTDATACOPY: "EVENTDATACOPY",
 
 	// 0xd range - eof ops.
 	DATALOAD:  "DATALOAD",
@@ -634,6 +642,8 @@ var stringToOp = map[string]OpCode{
 	"FRAMEPARAM":      FRAMEPARAM,
 	"SIGPARAM":        SIGPARAM,
 	"SIGDATACOPY":     SIGDATACOPY,
+	"TXTRACE":         TXTRACE,
+	"EVENTDATACOPY":   EVENTDATACOPY,
 	"DATALOAD":        DATALOAD,
 	"DATALOADN":       DATALOADN,
 	"DATASIZE":        DATASIZE,

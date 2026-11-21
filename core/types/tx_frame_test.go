@@ -193,7 +193,7 @@ func TestFrameTxValidateStatic(t *testing.T) {
 				tx.Frames[i] = Frame{Mode: FrameModeSender, Value: new(uint256.Int)}
 			}
 		}, ErrFrameTxTooManyFrames},
-		{"bad mode", func(tx *FrameTx) { tx.Frames[0].Mode = 3 }, ErrFrameTxInvalidMode},
+		{"bad mode", func(tx *FrameTx) { tx.Frames[0].Mode = 4 }, ErrFrameTxInvalidMode},
 		{"reserved flags", func(tx *FrameTx) { tx.Frames[0].Flags = 0x8 }, ErrFrameTxInvalidFlags},
 		{"value on verify", func(tx *FrameTx) { tx.Frames[0].Value = uint256.NewInt(1) }, ErrFrameTxValueNotSender},
 		{"approve-exec non-sender target", func(tx *FrameTx) {

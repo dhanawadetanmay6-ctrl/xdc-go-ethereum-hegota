@@ -149,9 +149,11 @@ func (ch frameOwnerChange) copy() journalEntry { return ch }
 
 // SetFrameState attaches (or detaches, with nil) the frame-transaction
 // execution state. Called by the frame transition engine at transaction
-// boundaries; not journaled (a tx-boundary operation).
+// boundaries; not journaled (a tx-boundary operation). The cached EIP-7906
+// transaction diff is scoped to one frame transaction and is dropped here.
 func (s *StateDB) SetFrameState(fs *FrameState) {
 	s.frameState = fs
+	s.txTraceDiff = nil
 }
 
 // FrameState returns the attached frame-transaction execution state, or nil

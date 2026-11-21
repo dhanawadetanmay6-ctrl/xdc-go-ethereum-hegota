@@ -59,6 +59,10 @@ const (
 	FrameModeDefault = 0x0 // execute frame as ENTRY_POINT
 	FrameModeVerify  = 0x1 // frame identifies as transaction validation
 	FrameModeSender  = 0x2 // execute frame as tx.sender
+	// FrameModeAssert is the EIP-7906 ASSERT frame mode: a read-only
+	// (STATICCALL) trailing-suffix frame whose failure reverts the
+	// transaction's execution body without invalidating the transaction.
+	FrameModeAssert = 0x3
 
 	// Frame flags (EIP-8141). Bits 0-1 are the approval scope bitmask, bit 2
 	// is the atomic-batch flag, bits 3+ are reserved.
@@ -377,17 +381,21 @@ var (
 	ErrFrameTxBatchLast         = errors.New("atomic batch flag on last frame")
 	ErrFrameTxBatchVerifyNext   = errors.New("atomic batch followed by VERIFY frame")
 	ErrFrameTxBatchApproveScope = errors.New("atomic batch frame carries approval scope")
-	ErrFrameSigScheme           = errors.New("invalid signature scheme")
-	ErrFrameSigSignerLen        = errors.New("invalid signature signer length")
-	ErrFrameSigMsgLen           = errors.New("invalid signature msg length")
-	ErrFrameSigZeroMsg          = errors.New("explicit zero signature digest")
-	ErrFrameBlobHashVersion     = errors.New("blob versioned hash has invalid version")
-	ErrFrameTxGasLimitHigh      = errors.New("frame transaction exceeds EIP-7825 gas cap")
-	ErrExpiryFrameFlags         = errors.New("expiry verifier frame has non-zero flags")
-	ErrExpiryFrameValue         = errors.New("expiry verifier frame carries value")
-	ErrExpiryFrameStateGas      = errors.New("expiry verifier frame has non-zero state gas limit")
-	ErrExpiryFrameData          = errors.New("expiry verifier frame calldata is not 8 bytes")
-	ErrExpiryFrameMultiple      = errors.New("multiple expiry verifier frames")
+	// EIP-7906 (ASSERT frames).
+	ErrFrameTxAssertNotSuffix = errors.New("non-ASSERT frame after an ASSERT frame")
+	ErrFrameTxBatchAssert     = errors.New("atomic batch flag on ASSERT frame")
+	ErrFrameTxBatchAssertNext = errors.New("atomic batch followed by ASSERT frame")
+	ErrFrameSigScheme         = errors.New("invalid signature scheme")
+	ErrFrameSigSignerLen      = errors.New("invalid signature signer length")
+	ErrFrameSigMsgLen         = errors.New("invalid signature msg length")
+	ErrFrameSigZeroMsg        = errors.New("explicit zero signature digest")
+	ErrFrameBlobHashVersion   = errors.New("blob versioned hash has invalid version")
+	ErrFrameTxGasLimitHigh    = errors.New("frame transaction exceeds EIP-7825 gas cap")
+	ErrExpiryFrameFlags       = errors.New("expiry verifier frame has non-zero flags")
+	ErrExpiryFrameValue       = errors.New("expiry verifier frame carries value")
+	ErrExpiryFrameStateGas    = errors.New("expiry verifier frame has non-zero state gas limit")
+	ErrExpiryFrameData        = errors.New("expiry verifier frame calldata is not 8 bytes")
+	ErrExpiryFrameMultiple    = errors.New("multiple expiry verifier frames")
 )
 
 // ValidateStatic enforces the stateless validity constraints of EIP-8141
@@ -428,9 +436,18 @@ func (tx *FrameTx) ValidateStatic() error {
 		}
 	}
 	var totalFrameGas, totalFrameExecutionGas uint64
+	seenAssert := false
 	for i, frame := range tx.Frames {
-		if frame.Mode != FrameModeDefault && frame.Mode != FrameModeVerify && frame.Mode != FrameModeSender {
+		if frame.Mode != FrameModeDefault && frame.Mode != FrameModeVerify && frame.Mode != FrameModeSender && frame.Mode != FrameModeAssert {
 			return ErrFrameTxInvalidMode
+		}
+		// EIP-7906: ASSERT frames form a contiguous trailing suffix of
+		// tx.frames. Once any frame has mode ASSERT, every subsequent frame
+		// must also have mode ASSERT.
+		if frame.Mode == FrameModeAssert {
+			seenAssert = true
+		} else if seenAssert {
+			return ErrFrameTxAssertNotSuffix
 		}
 		if frame.Flags > FrameFlagValidMask {
 			return ErrFrameTxInvalidFlags
@@ -458,16 +475,24 @@ func (tx *FrameTx) ValidateStatic() error {
 			}
 		}
 		// Atomic batch flag is only valid on non-VERIFY frames and requires a
-		// subsequent non-VERIFY frame to batch with.
+		// subsequent non-VERIFY frame to batch with. EIP-7906 additionally
+		// forbids the flag on ASSERT frames and on a frame directly before an
+		// ASSERT frame, so no atomic batch ever contains an ASSERT frame.
 		if frame.Flags&FrameFlagAtomicBatch != 0 {
 			if frame.Mode == FrameModeVerify {
 				return ErrFrameTxBatchVerify
+			}
+			if frame.Mode == FrameModeAssert {
+				return ErrFrameTxBatchAssert
 			}
 			if i+1 >= len(tx.Frames) {
 				return ErrFrameTxBatchLast
 			}
 			if tx.Frames[i+1].Mode == FrameModeVerify {
 				return ErrFrameTxBatchVerifyNext
+			}
+			if tx.Frames[i+1].Mode == FrameModeAssert {
+				return ErrFrameTxBatchAssertNext
 			}
 		}
 		// A frame belongs to a batch when it or its predecessor carries

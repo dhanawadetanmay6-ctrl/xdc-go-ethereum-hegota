@@ -294,10 +294,30 @@ func (e *frameEngine) runFrames(fs *state.FrameState, txSnapshot int) error {
 	var (
 		batchStart    = -1
 		batchSnapshot int
+		// EIP-7906: when the transaction carries ASSERT frames, track the
+		// state snapshot taken immediately after the frame whose execution
+		// set payer (the last frame of the validation prefix). An ASSERT
+		// failure restores state and the approval context to that point.
+		payerSnapshot = -1
+		payerIndex    = -1
 	)
+	hasAssert := false
+	for _, f := range tx.Frames {
+		if f.Mode == types.FrameModeAssert {
+			hasAssert = true
+			break
+		}
+	}
 	for i := 0; i < len(tx.Frames); i++ {
 		frame := &tx.Frames[i]
 		e.fc.CurrentFrame = i
+
+		if hasAssert && payerSnapshot == -1 && fs.PayerSet {
+			// First iteration after the payer-setting frame completed:
+			// capture the prefix-end condition.
+			payerSnapshot = e.sdb.Snapshot()
+			payerIndex = i - 1
+		}
 
 		// Track atomic batch boundaries. A batch is a maximal contiguous
 		// sequence [i, j] where frames i..j-1 carry ATOMIC_BATCH_FLAG and
@@ -341,6 +361,20 @@ func (e *frameEngine) runFrames(fs *state.FrameState, txSnapshot int) error {
 			e.sdb.RevertToSnapshot(txSnapshot)
 			return fmt.Errorf("%w: frame %d: %v", ErrFrameTxVerifyFailed, i, vmerr)
 		}
+		// EIP-7906: an ASSERT failure never invalidates the transaction. It
+		// reverts the entire execution body (overriding atomic-batch
+		// unrolling — no batch can contain an ASSERT frame), ends frame
+		// execution, and leaves the transaction valid with the validation
+		// prefix committed. With no payer set there is nothing to restore
+		// and the transaction is invalid under EIP-8141.
+		if frame.Mode == types.FrameModeAssert {
+			if !fs.PayerSet || payerSnapshot == -1 {
+				e.sdb.RevertToSnapshot(txSnapshot)
+				return ErrFrameTxNoPayer
+			}
+			e.unrollAssertFailure(payerSnapshot, payerIndex, i)
+			break
+		}
 		if inBatch {
 			// Unroll the atomic batch: restore the batch-entry state, mark
 			// the remaining frames of the batch skipped, and jump past them.
@@ -377,7 +411,7 @@ func (e *frameEngine) runFrame(fs *state.FrameState, frame *types.Frame, index i
 			return errTxInvalid{ErrFrameTxSenderUnapproved}
 		}
 		caller = tx.Sender
-	default: // DEFAULT, VERIFY
+	default: // DEFAULT, VERIFY, ASSERT (EIP-7906: ASSERT caller is ENTRY_POINT)
 		caller = types.EntryPoint
 	}
 	// ORIGIN returns the frame's caller throughout all call depths.
@@ -436,8 +470,9 @@ func (e *frameEngine) callFrame(gas *vm.GasBudget, caller, target common.Address
 		result vm.GasBudget
 		err    error
 	)
-	if frame.Mode == types.FrameModeVerify {
-		// VERIFY frames execute as STATICCALL.
+	if frame.Mode == types.FrameModeVerify || frame.Mode == types.FrameModeAssert {
+		// VERIFY frames execute as STATICCALL (EIP-8141), and so do ASSERT
+		// frames (EIP-7906) — without the APPROVE exception VERIFY enjoys.
 		_, result, err = e.evm.StaticCall(caller, target, frame.Data, *gas)
 	} else {
 		_, result, err = e.evm.Call(caller, target, frame.Data, *gas, frameValue(frame))
@@ -562,6 +597,36 @@ func (e *frameEngine) unrollBatch(batchStart, failedIndex int) int {
 		}
 	}
 	return end
+}
+
+// unrollAssertFailure applies the EIP-7906 ASSERT-failure rules after the
+// ASSERT frame at failedIndex reverted or halted: state and the approval
+// context are restored to their condition immediately after the frame whose
+// execution set payer (payerSnapshot, the end of the validation prefix); the
+// receipts of the reverted execution-body frames keep their status and
+// execution gas but their logs are discarded and their recorded state gas is
+// removed; the remaining ASSERT frames are marked skipped (status 2) with
+// zero gas. The failing frame's own receipt (status 0, execution gas used)
+// was already finalized by absorbResult.
+func (e *frameEngine) unrollAssertFailure(payerSnapshot, payerIndex, failedIndex int) {
+	e.sdb.RevertToSnapshot(payerSnapshot)
+	// The journaled rollback already restored the receipt state-gas fields
+	// written after the prefix checkpoint (body frames read as zero again)
+	// and discarded the body's logs from the state. Drop the log slices
+	// attached to the reverted body frames' receipts and pin their state
+	// gas at zero through the journaled path. Succeeded ASSERT frames in
+	// this range are unaffected: they emit no logs and use no state gas.
+	for j := payerIndex + 1; j < failedIndex; j++ {
+		e.receipts[j].Logs = nil
+		e.sdb.SetFrameReceiptStateGas(j, 0)
+	}
+	// The remaining ASSERT frames are not executed.
+	for j := failedIndex + 1; j < len(e.tx.Frames); j++ {
+		e.fc.FrameStatuses[j] = vm.FrameStatusSkipped
+		e.fc.FrameGasUsedExecution[j] = 0
+		e.fc.FrameFinalized[j] = true
+		e.receipts[j] = &types.FrameReceipt{Status: vm.FrameStatusSkipped}
+	}
 }
 
 // settle performs EIP-8141 transaction settlement: gas accounting, fee

@@ -143,6 +143,12 @@ type StateDB struct {
 	// are journaled (see statedb_frame.go) so snapshots revert them.
 	frameState *FrameState
 
+	// txTraceDiff caches the EIP-7906 transaction state diff built for the
+	// TXTRACE/EVENTDATACOPY opcodes. Valid only while a frame transaction
+	// executes (cleared by SetFrameState at frame-engine boundaries); the
+	// diff is frozen during the read-only ASSERT suffix it serves.
+	txTraceDiff *TxTraceDiff
+
 	// Journal of state modifications. This is the backbone of
 	// Snapshot and RevertToSnapshot.
 	journal *journal

@@ -123,6 +123,12 @@ func (fc *FrameTxContext) Approve(evm *EVM, gas *GasBudget, addr common.Address,
 		return false, true
 	}
 	tx := fc.Tx
+	// EIP-7906: APPROVE is not granted the VERIFY-frame exception inside an
+	// ASSERT frame. Calling APPROVE anywhere in an ASSERT frame's call
+	// subtree is an ordinary STATICCALL violation: exceptional halt.
+	if tx.Frames[fc.CurrentFrame].Mode == types.FrameModeAssert {
+		return false, true
+	}
 	// If ADDRESS != resolved_target, revert.
 	if addr != fc.ResolvedTarget {
 		return true, false
