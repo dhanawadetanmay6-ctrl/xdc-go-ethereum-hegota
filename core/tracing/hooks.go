@@ -567,6 +567,11 @@ const (
 	// CodeChangeSelfDestruct is when contract code is cleared due to self-destruct.
 	CodeChangeSelfDestruct CodeChangeReason = 5
 
+	// CodeChangeSetCodeFrom is when an account's code hash is set to reference
+	// another account's existing deployed code via EIP-8298 SETCODEFROM. The
+	// bytecode blob is not re-deposited; only the hash reference changes.
+	CodeChangeSetCodeFrom CodeChangeReason = 7
+
 	// CodeChangeRevert reverts the code to a previous value on call failure.
 	// Emitted only when the tracer opts into WrapWithJournal.
 	CodeChangeRevert CodeChangeReason = 6

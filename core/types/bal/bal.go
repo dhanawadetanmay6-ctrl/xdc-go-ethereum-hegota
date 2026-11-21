@@ -51,16 +51,23 @@ type ConstructionAccountAccess struct {
 	// CodeChange contains the post-state contract code of an account keyed
 	// by tx index.
 	CodeChange map[uint32][]byte `json:"codeChange,omitempty"`
+
+	// CodeChangeHashes contains post-state code hashes adopted via EIP-8298
+	// SETCODEFROM, keyed by tx index. These encode as the three-element
+	// CodeChange form [block_access_index, b"", new_code_hash]; a given tx
+	// index appears in either CodeChange or CodeChangeHashes, never both.
+	CodeChangeHashes map[uint32]common.Hash `json:"codeChangeHashes,omitempty"`
 }
 
 // NewConstructionAccountAccess initializes the account access object.
 func NewConstructionAccountAccess() *ConstructionAccountAccess {
 	return &ConstructionAccountAccess{
-		StorageWrites:  make(map[common.Hash]map[uint32]common.Hash),
-		StorageReads:   make(map[common.Hash]struct{}),
-		BalanceChanges: make(map[uint32]*uint256.Int),
-		NonceChanges:   make(map[uint32]uint64),
-		CodeChange:     make(map[uint32][]byte),
+		StorageWrites:    make(map[common.Hash]map[uint32]common.Hash),
+		StorageReads:     make(map[common.Hash]struct{}),
+		BalanceChanges:   make(map[uint32]*uint256.Int),
+		NonceChanges:     make(map[uint32]uint64),
+		CodeChange:       make(map[uint32][]byte),
+		CodeChangeHashes: make(map[uint32]common.Hash),
 	}
 }
 
@@ -114,8 +121,21 @@ func (b *ConstructionBlockAccessList) CodeChange(address common.Address, txIndex
 	if _, ok := b.Accounts[address]; !ok {
 		b.Accounts[address] = NewConstructionAccountAccess()
 	}
+	delete(b.Accounts[address].CodeChangeHashes, txIndex)
 	// TODO(rjl493456442) is it essential to deep-copy the code?
 	b.Accounts[address].CodeChange[txIndex] = bytes.Clone(code)
+}
+
+// CodeChangeHash records a code hash adopted via EIP-8298 SETCODEFROM.
+// Encoded as the three-element CodeChange form ([index, b"", hash]); the
+// bytecode is already present in the pre-block state or an earlier-index
+// code change and is never repeated in the BAL.
+func (b *ConstructionBlockAccessList) CodeChangeHash(address common.Address, txIndex uint32, codeHash common.Hash) {
+	if _, ok := b.Accounts[address]; !ok {
+		b.Accounts[address] = NewConstructionAccountAccess()
+	}
+	delete(b.Accounts[address].CodeChange, txIndex)
+	b.Accounts[address].CodeChangeHashes[txIndex] = codeHash
 }
 
 // NonceChange records tx post-state nonce of any contract-like accounts whose
@@ -191,6 +211,9 @@ func (b *ConstructionBlockAccessList) Merge(other *ConstructionBlockAccessList) 
 		for txIdx, code := range otherAcc.CodeChange {
 			acc.CodeChange[txIdx] = code
 		}
+		for txIdx, hash := range otherAcc.CodeChangeHashes {
+			acc.CodeChangeHashes[txIdx] = hash
+		}
 	}
 }
 
@@ -219,6 +242,7 @@ func (b *ConstructionBlockAccessList) Copy() *ConstructionBlockAccessList {
 			codes[index] = bytes.Clone(code)
 		}
 		aaCopy.CodeChange = codes
+		aaCopy.CodeChangeHashes = maps.Clone(aa.CodeChangeHashes)
 		res.Accounts[addr] = &aaCopy
 	}
 	return res

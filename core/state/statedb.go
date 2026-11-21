@@ -526,6 +526,27 @@ func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeC
 	return nil
 }
 
+// SetCodeHashReference points the account's code hash at bytecode that already
+// exists in the content-addressed code store (EIP-8298 SETCODEFROM adoption).
+// No bytecode is deposited for the account: the persisted account entry carries
+// only the hash. The code bytes must be the ones currently behind codeHash in
+// consensus state (i.e. the source account's code); they are cached on the
+// state object so mid-block read paths resolve them without re-depositing.
+func (s *StateDB) SetCodeHashReference(addr common.Address, codeHash common.Hash, code []byte) {
+	stateObject := s.getOrNewStateObject(addr)
+	if stateObject == nil {
+		return
+	}
+	prevHash := common.BytesToHash(stateObject.CodeHash())
+	prevCode := stateObject.code
+	prevDirty := stateObject.dirtyCode
+	if prevHash == codeHash {
+		return
+	}
+	s.journal.setCodeHashReference(addr, prevHash, prevCode, prevDirty)
+	stateObject.setCodeHashReference(codeHash, code)
+}
+
 func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
 	if stateObject := s.getOrNewStateObject(addr); stateObject != nil {
 		return stateObject.SetState(key, value)
@@ -870,12 +891,28 @@ func (s *StateDB) recordAccessListChanges(addr common.Address, state *journalMut
 		s.stateAccessList.NonceChange(addr, s.blockAccessIndex, nonce)
 	}
 	if state.codeSet {
-		var code []byte
-		if obj != nil {
-			code = obj.Code()
-		}
-		if !bytes.Equal(code, state.code) {
-			s.stateAccessList.CodeChange(addr, s.blockAccessIndex, code)
+		if state.codeAdopted {
+			// EIP-8298: the tx's final code change was a SETCODEFROM
+			// adoption. BAL records [index, b"", new_code_hash], never
+			// bytecode (EIP-7928 extension).
+			if obj != nil {
+				hash := common.BytesToHash(obj.CodeHash())
+				prevHash := crypto.Keccak256Hash(state.code)
+				if len(state.code) == 0 {
+					prevHash = types.EmptyCodeHash
+				}
+				if hash != prevHash {
+					s.stateAccessList.CodeChangeHash(addr, s.blockAccessIndex, hash)
+				}
+			}
+		} else {
+			var code []byte
+			if obj != nil {
+				code = obj.Code()
+			}
+			if !bytes.Equal(code, state.code) {
+				s.stateAccessList.CodeChange(addr, s.blockAccessIndex, code)
+			}
 		}
 	}
 }

@@ -643,6 +643,17 @@ func (s *stateObject) SetCode(codeHash common.Hash, code []byte) (prev []byte) {
 	return prev
 }
 
+// setCodeHashReference sets the account's code hash to reference bytecode that
+// already exists in the content-addressed code store, without marking the code
+// dirty (no blob is re-written at commit) — EIP-8298 SETCODEFROM adoption.
+// The bytecode bytes are cached on the object so mid-block read paths
+// (GetCode/CodeSize) resolve them; this is an in-memory cache only, not a
+// state copy: the persisted account entry carries the hash alone.
+func (s *stateObject) setCodeHashReference(codeHash common.Hash, code []byte) {
+	s.code = code
+	s.data.CodeHash = codeHash[:]
+}
+
 func (s *stateObject) setCode(codeHash common.Hash, code []byte) {
 	s.code = code
 	s.data.CodeHash = codeHash[:]

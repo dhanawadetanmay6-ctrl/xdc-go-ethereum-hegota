@@ -44,6 +44,9 @@ type StateDB interface {
 
 	// SetCode sets the new code for the address, and returns the previous code, if any.
 	SetCode(common.Address, []byte, tracing.CodeChangeReason) []byte
+	// SetCodeHashReference points the account's code hash at existing bytecode
+	// without depositing the bytes (EIP-8298 SETCODEFROM adoption).
+	SetCodeHashReference(common.Address, common.Hash, []byte)
 	GetCodeSize(common.Address) int
 
 	AddRefund(uint64)

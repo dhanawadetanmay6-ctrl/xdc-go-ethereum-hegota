@@ -1916,6 +1916,35 @@ func (pool *LegacyPool) demoteUnexecutables() {
 	for addr, list := range pool.pending {
 		nonce := pool.currentState.GetNonce(addr)
 
+		// EIP-8298: once an account has regular deployed code — e.g. after
+		// adopting code via SETCODEFROM — ECDSA-authenticated transactions
+		// from it are permanently invalid (EIP-3607, enforced in
+		// state_transition preCheck). Evict its pending ECDSA transactions.
+		// EIP-8141 frame transactions are NOT evicted: the adopted code is
+		// exactly how the account keeps acting. EIP-7702 delegated accounts
+		// (delegation indicator, not regular code) keep the existing
+		// delegation-limit handling.
+		if code := pool.currentState.GetCode(addr); len(code) > 0 {
+			if _, delegated := types.ParseDelegation(code); !delegated {
+				var evicted int
+				for _, tx := range list.Flatten() {
+					if tx.Type() == types.FrameTxType {
+						continue
+					}
+					if list.txs.Remove(tx.Nonce()) {
+						list.subTotalCost([]*types.Transaction{tx})
+						pool.all.Remove(tx.Hash())
+						evicted++
+						log.Trace("Removed pending transaction from account with adopted code", "hash", tx.Hash(), "account", addr)
+					}
+				}
+				if evicted > 0 {
+					pool.priced.Removed(evicted)
+					pendingGauge.Dec(int64(evicted))
+				}
+			}
+		}
+
 		// Drop all transactions that are deemed too old (low nonce)
 		olds := list.Forward(nonce)
 		for _, tx := range olds {

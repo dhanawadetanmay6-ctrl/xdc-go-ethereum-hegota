@@ -701,6 +701,17 @@ func (evm *EVM) initNewContract(contract *Contract, address common.Address) ([]b
 	if err != nil {
 		return ret, err
 	}
+	// EIP-8298: if the initcode adopted code via SETCODEFROM, the created
+	// account's code hash is already set. The initcode's return data is then
+	// treated as empty for contract-creation completion: it is not validated,
+	// hashed, installed, or charged code-deposit (execution or state) gas,
+	// and the adopted code hash is preserved. Account-creation costs of the
+	// creation itself are charged as usual by the caller/create paths.
+	if evm.chainRules.IsBogota {
+		if hash := evm.StateDB.GetCodeHash(address); hash != (common.Hash{}) && hash != types.EmptyCodeHash {
+			return ret, nil
+		}
+	}
 	// Check prefix before gas calculation.
 	// Reject code starting with 0xEF if EIP-3541 is enabled.
 	if len(ret) >= 1 && ret[0] == 0xEF && evm.chainRules.IsLondon {

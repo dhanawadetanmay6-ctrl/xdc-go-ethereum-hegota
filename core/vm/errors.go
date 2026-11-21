@@ -34,10 +34,13 @@ var (
 	ErrMaxInitCodeSizeExceeded  = errors.New("max initcode size exceeded")
 	ErrInvalidJump              = errors.New("invalid jump destination")
 	ErrWriteProtection          = errors.New("write protection")
-	ErrReturnDataOutOfBounds    = errors.New("return data out of bounds")
-	ErrGasUintOverflow          = errors.New("gas uint64 overflow")
-	ErrInvalidCode              = errors.New("invalid code: must not begin with 0xef")
-	ErrNonceUintOverflow        = errors.New("nonce uint64 overflow")
+	// ErrSetCodeFromSystemContract is returned when SETCODEFROM executes while
+	// the current account is a system contract (EIP-8298 exceptional halt).
+	ErrSetCodeFromSystemContract = errors.New("setcodefrom in system contract")
+	ErrReturnDataOutOfBounds     = errors.New("return data out of bounds")
+	ErrGasUintOverflow           = errors.New("gas uint64 overflow")
+	ErrInvalidCode               = errors.New("invalid code: must not begin with 0xef")
+	ErrNonceUintOverflow         = errors.New("nonce uint64 overflow")
 
 	// errStopToken is an internal token indicating interpreter loop termination,
 	// never returned to outside callers.

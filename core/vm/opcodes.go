@@ -213,6 +213,11 @@ const (
 	LOG4
 )
 
+// 0xa7 - EIP-8298 code adoption.
+const (
+	SETCODEFROM OpCode = 0xa7
+)
+
 // 0xaa and 0xb0 range - EIP-8141 frame transaction ops.
 const (
 	APPROVE       OpCode = 0xaa
@@ -333,6 +338,7 @@ var opCodeToString = [256]string{
 	BLOBHASH:    "BLOBHASH",
 	BLOBBASEFEE: "BLOBBASEFEE",
 	SLOTNUM:     "SLOTNUM",
+	SETCODEFROM: "SETCODEFROM",
 
 	// 0x50 range - 'storage' and execution.
 	POP:      "POP",
@@ -523,6 +529,7 @@ var stringToOp = map[string]OpCode{
 	"CHAINID":         CHAINID,
 	"BASEFEE":         BASEFEE,
 	"BLOBHASH":        BLOBHASH,
+	"SETCODEFROM":     SETCODEFROM,
 	"BLOBBASEFEE":     BLOBBASEFEE,
 	"SLOTNUM":         SLOTNUM,
 	"DELEGATECALL":    DELEGATECALL,

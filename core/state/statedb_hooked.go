@@ -219,6 +219,22 @@ func (s *hookedStateDB) SetCode(address common.Address, code []byte, reason trac
 	return prev
 }
 
+// SetCodeHashReference implements EIP-8298 adoption. Tracers observe the code
+// change with the referenced bytecode and the CodeChangeSetCodeFrom reason.
+func (s *hookedStateDB) SetCodeHashReference(address common.Address, codeHash common.Hash, code []byte) {
+	prev := s.inner.GetCode(address)
+	prevHash := s.inner.GetCodeHash(address)
+	s.inner.SetCodeHashReference(address, codeHash, code)
+
+	if (s.hooks.OnCodeChangeV2 != nil || s.hooks.OnCodeChange != nil) && prevHash != codeHash {
+		if s.hooks.OnCodeChangeV2 != nil {
+			s.hooks.OnCodeChangeV2(address, prevHash, prev, codeHash, code, tracing.CodeChangeSetCodeFrom)
+		} else if s.hooks.OnCodeChange != nil {
+			s.hooks.OnCodeChange(address, prevHash, prev, codeHash, code)
+		}
+	}
+}
+
 func (s *hookedStateDB) SetState(address common.Address, key common.Hash, value common.Hash) common.Hash {
 	prev := s.inner.SetState(address, key, value)
 	if s.hooks.OnStorageChange != nil && prev != value {

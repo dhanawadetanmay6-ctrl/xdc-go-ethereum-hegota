@@ -68,6 +68,10 @@ type journalMutationState struct {
 	nonceSet   bool
 	code       []byte
 	codeSet    bool
+	// codeAdopted records whether the LAST code mutation of the current tx
+	// was an EIP-8298 SETCODEFROM adoption (BAL hash form) rather than an
+	// ordinary bytecode installation (BAL bytecode form).
+	codeAdopted bool
 }
 
 func (s *journalMutationState) add(kind journalMutationKind) {
@@ -360,9 +364,25 @@ func (j *journal) balanceChange(addr common.Address, previous *uint256.Int, prev
 
 func (j *journal) setCode(address common.Address, prevCode []byte) {
 	j.stashCode(address, prevCode)
+	// An ordinary code installation makes the tx's final code form bytecode
+	// again (EIP-8298 BAL rule: hash form only when the LAST code change of
+	// the transaction was a SETCODEFROM adoption).
+	j.mutationStateFor(address).codeAdopted = false
 	j.append(codeChange{
 		account:  address,
 		prevCode: prevCode,
+	})
+}
+
+// setCodeHashReference journals an EIP-8298 adoption (hash-only code change).
+func (j *journal) setCodeHashReference(address common.Address, prevHash common.Hash, prevCode []byte, prevDirtyCode bool) {
+	j.stashCode(address, prevCode)
+	j.mutationStateFor(address).codeAdopted = true
+	j.append(codeHashReferenceChange{
+		account:       address,
+		prevHash:      prevHash,
+		prevCode:      prevCode,
+		prevDirtyCode: prevDirtyCode,
 	})
 }
 
@@ -439,6 +459,17 @@ type (
 	codeChange struct {
 		account  common.Address
 		prevCode []byte
+	}
+
+	// codeHashReferenceChange journals an EIP-8298 SETCODEFROM adoption: only
+	// the account's code hash changed (the bytecode blob is shared with the
+	// source account and is not re-deposited). prevHash/prevCode/prevDirtyCode
+	// restore the exact pre-adoption object state on revert.
+	codeHashReferenceChange struct {
+		account       common.Address
+		prevHash      common.Hash
+		prevCode      []byte
+		prevDirtyCode bool
 	}
 
 	// Changes to other state values.
@@ -576,6 +607,26 @@ func (ch codeChange) copy() journalEntry {
 	return codeChange{
 		account:  ch.account,
 		prevCode: ch.prevCode,
+	}
+}
+
+func (ch codeHashReferenceChange) revert(s *StateDB) {
+	obj := s.getStateObject(ch.account)
+	obj.data.CodeHash = ch.prevHash[:]
+	obj.code = ch.prevCode
+	obj.dirtyCode = ch.prevDirtyCode
+}
+
+func (ch codeHashReferenceChange) mutation() (common.Address, journalMutationKind, bool) {
+	return ch.account, journalMutationKindCode, true
+}
+
+func (ch codeHashReferenceChange) copy() journalEntry {
+	return codeHashReferenceChange{
+		account:       ch.account,
+		prevHash:      ch.prevHash,
+		prevCode:      slices.Clone(ch.prevCode),
+		prevDirtyCode: ch.prevDirtyCode,
 	}
 }
 

@@ -216,15 +216,25 @@ type encodingAccountNonceMarshaling struct {
 	PostNonce        hexutil.Uint64
 }
 
-// encodingCodeChange is one transaction's deployed runtime bytecode for an account.
+// encodingCodeChange is one transaction's code change for an account.
+//
+// EIP-7928 form (two elements): NewCode carries the installed bytecode
+// (contract creation or EIP-7702 delegation) and NewCodeHash is nil.
+//
+// EIP-8298 form (three elements): a SETCODEFROM adoption — NewCode is empty
+// and NewCodeHash carries the adopted code hash. The bytecode behind the hash
+// is guaranteed to exist in the pre-block state or an earlier-index code
+// change; it is never repeated in the BAL.
 type encodingCodeChange struct {
-	BlockAccessIndex uint32 `json:"blockAccessIndex"`
-	NewCode          []byte `json:"newCode"`
+	BlockAccessIndex uint32       `json:"blockAccessIndex"`
+	NewCode          []byte       `json:"newCode"`
+	NewCodeHash      *common.Hash `json:"newCodeHash,omitempty" rlp:"optional"`
 }
 
 type encodingCodeChangeMarshaling struct {
 	BlockAccessIndex hexutil.Uint64
 	NewCode          hexutil.Bytes
+	NewCodeHash      *common.Hash
 }
 
 // AccountAccess is the encoding format of ConstructionAccountAccess.
@@ -320,8 +330,20 @@ func (e *AccountAccess) validate(maxBALIndex int) error {
 		return fmt.Errorf("code change index exceeds limit, index: %d, limit: %d", e.CodeChanges[len(e.CodeChanges)-1].BlockAccessIndex, maxBALIndex)
 	}
 	// Check that none of the code changes report a new code which is larger
-	// than the max allowed by the protocol
+	// than the max allowed by the protocol, and that the EIP-8298 adoption
+	// form is well-formed: hash-form entries carry an empty new_code and a
+	// non-nil new_code_hash; bytecode-form entries carry no hash.
 	for _, change := range e.CodeChanges {
+		if change.NewCodeHash != nil {
+			// EIP-8298 adoption form: [index, b"", new_code_hash].
+			if len(change.NewCode) != 0 {
+				return errors.New("code change with new_code_hash must have empty new_code")
+			}
+			if *change.NewCodeHash == (common.Hash{}) {
+				return errors.New("code change with zero new_code_hash")
+			}
+			continue
+		}
 		if len(change.NewCode) > params.MaxCodeSizeAmsterdam {
 			return errors.New("code change contained oversized code")
 		}
@@ -438,10 +460,27 @@ func (a *ConstructionAccountAccess) toEncodingObj(addr common.Address) AccountAc
 		})
 	}
 
-	// Convert code change
+	// Convert code changes. A tx index appears in either the bytecode map
+	// (ordinary install, two-element encoding) or the hash map (EIP-8298
+	// adoption, three-element encoding), never both; the two maps are merged
+	// into one index-sorted list.
 	codeIndices := slices.Collect(maps.Keys(a.CodeChange))
+	for idx := range a.CodeChangeHashes {
+		if _, ok := a.CodeChange[idx]; !ok {
+			codeIndices = append(codeIndices, idx)
+		}
+	}
 	slices.SortFunc(codeIndices, cmp.Compare)
 	for _, idx := range codeIndices {
+		if hash, ok := a.CodeChangeHashes[idx]; ok {
+			h := hash
+			res.CodeChanges = append(res.CodeChanges, encodingCodeChange{
+				BlockAccessIndex: idx,
+				NewCode:          nil,
+				NewCodeHash:      &h,
+			})
+			continue
+		}
 		res.CodeChanges = append(res.CodeChanges, encodingCodeChange{
 			BlockAccessIndex: idx,
 

@@ -424,6 +424,19 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	if next > tx.Nonce() {
 		return fmt.Errorf("%w: next nonce %v, tx nonce %v", core.ErrNonceTooLow, next, tx.Nonce())
 	}
+	// EIP-8298/EIP-3607: an account with regular deployed code — for example
+	// after adopting code via SETCODEFROM — cannot originate ECDSA-signed
+	// transactions; reject them at admission instead of parking them. EIP-7702
+	// delegated accounts (delegation indicator) remain admissible, and
+	// EIP-8141 frame transactions are exempt: their sender may be a contract
+	// account whose code is validation logic.
+	if tx.Type() != types.FrameTxType {
+		if code := opts.State.GetCode(from); len(code) > 0 {
+			if _, delegated := types.ParseDelegation(code); !delegated {
+				return fmt.Errorf("%w: address %v has deployed code", core.ErrSenderNoEOA, from.Hex())
+			}
+		}
+	}
 	// Ensure the transaction doesn't produce a nonce gap in pools that do not
 	// support arbitrary orderings
 	if opts.FirstNonceGap != nil {
