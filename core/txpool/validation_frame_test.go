@@ -19,6 +19,7 @@
 package txpool
 
 import (
+	"errors"
 	"math/big"
 	"strings"
 	"testing"
@@ -42,6 +43,7 @@ func framePoolChainConfig() *params.ChainConfig {
 	cfg := *params.MergedTestChainConfig
 	cfg.AmsterdamTime = new(uint64)
 	cfg.BogotaTime = new(uint64)
+	cfg.KeyedNonceTime = new(uint64) // EIP-8250: tests build keyed-form transactions
 	return &cfg
 }
 
@@ -61,9 +63,9 @@ func mkPoolFrameTx(t *testing.T, cfg *params.ChainConfig, nonce uint64, fee *uin
 	t.Helper()
 	receiver := common.HexToAddress("0xbeef")
 	ft := &types.FrameTx{
-		ChainID: uint256.MustFromBig(cfg.ChainID),
-		Nonce:   nonce,
-		Sender:  framePoolSender,
+		ChainID:  uint256.MustFromBig(cfg.ChainID),
+		NonceSeq: nonce,
+		Sender:   framePoolSender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveScopeMask,
 				Limits: types.FrameGasLimits{Execution: 50_000}, Value: new(uint256.Int)},
@@ -211,9 +213,9 @@ func TestValidateFrameTransactionFloorReservation(t *testing.T) {
 	receiver := common.HexToAddress("0xbeef")
 	bigData := make([]byte, 4000) // all-zero: 64 gas/byte at the floor
 	ft := &types.FrameTx{
-		ChainID: uint256.MustFromBig(cfg.ChainID),
-		Nonce:   0,
-		Sender:  framePoolSender,
+		ChainID:  uint256.MustFromBig(cfg.ChainID),
+		NonceSeq: 0,
+		Sender:   framePoolSender,
 		Frames: []types.Frame{
 			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveScopeMask,
 				Limits: types.FrameGasLimits{Execution: 50_000}, Value: new(uint256.Int)},
@@ -243,5 +245,79 @@ func TestValidateFrameTransactionFloorReservation(t *testing.T) {
 	head := &types.Header{Number: big.NewInt(1), GasLimit: 200_000, Time: 1, Difficulty: big.NewInt(0), BaseFee: big.NewInt(1)}
 	if err := ValidateTransaction(tx, head, signer, framePoolOpts(cfg)); err == nil {
 		t.Fatal("floor-dominated frame tx admitted below its calldata floor")
+	}
+}
+
+// mkPoolKeyedFrameTx builds a signed keyed-form frame tx with the given
+// EIP-8250 nonce keys (used to exercise pool policy on keyed domains).
+func mkPoolKeyedFrameTx(t *testing.T, cfg *params.ChainConfig, seq uint64, keys ...uint64) *types.Transaction {
+	t.Helper()
+	receiver := common.HexToAddress("0xbeef")
+	nk := make([]uint256.Int, len(keys))
+	for i, k := range keys {
+		nk[i].SetUint64(k)
+	}
+	ft := &types.FrameTx{
+		ChainID:   uint256.MustFromBig(cfg.ChainID),
+		NonceKeys: nk,
+		NonceSeq:  seq,
+		Sender:    framePoolSender,
+		Frames: []types.Frame{
+			{Mode: types.FrameModeVerify, Flags: types.FrameFlagApproveScopeMask,
+				Limits: types.FrameGasLimits{Execution: 50_000}, Value: new(uint256.Int)},
+			{Mode: types.FrameModeSender, Target: &receiver,
+				Limits: types.FrameGasLimits{Execution: 100_000, State: 200_000}, Value: uint256.NewInt(1)},
+		},
+		Signatures: []types.FrameSignature{{Scheme: types.FrameSigSchemeSecp256k1, Signature: make([]byte, 65)}},
+		Fees: types.FrameFees{
+			MaxFee:               uint256.NewInt(1e15),
+			MaxPriorityFeePerGas: uint256.NewInt(1_000_000_000),
+		},
+	}
+	tx := types.NewTx(ft)
+	signed, err := types.SignFrameTx(framePoolKey, tx)
+	if err != nil {
+		t.Fatalf("SignFrameTx: %v", err)
+	}
+	return signed
+}
+
+// TestValidateFrameTransactionKeyedForkGate: before the keyed nonce fork the
+// keyed payload form is not admissible at all.
+func TestValidateFrameTransactionKeyedForkGate(t *testing.T) {
+	cfg := framePoolChainConfig()
+	cfg.KeyedNonceTime = nil // Amsterdam+Bogota only: pre-EIP-8250
+	head := framePoolHead(cfg)
+	signer := types.LatestSigner(cfg)
+
+	tx := mkPoolFrameTx(t, cfg, 0, uint256.NewInt(1e15))
+	if err := ValidateTransaction(tx, head, signer, framePoolOpts(cfg)); !errors.Is(err, types.ErrFrameTxKeyedBeforeFork) {
+		t.Fatalf("keyed form pre-fork: got %v, want ErrFrameTxKeyedBeforeFork", err)
+	}
+}
+
+// TestValidateFrameTransactionKeyedKeysStateless: post-fork, keyed-nonce
+// frame transactions pass stateless pool validation; the per-key stateful
+// sequence checks run in ValidateTransactionWithState, and admission,
+// replacement, revalidation and eviction are covered by the legacypool
+// side-pool tests (legacypool_keyed_frame_test.go).
+func TestValidateFrameTransactionKeyedKeysStateless(t *testing.T) {
+	cfg := framePoolChainConfig()
+	head := framePoolHead(cfg)
+	signer := types.LatestSigner(cfg)
+
+	tx := mkPoolKeyedFrameTx(t, cfg, 0, 7)
+	if err := ValidateTransaction(tx, head, signer, framePoolOpts(cfg)); err != nil {
+		t.Fatalf("keyed-keys tx rejected by stateless validation: %v", err)
+	}
+	// An unsorted key set remains statically invalid.
+	bad := mkPoolKeyedFrameTx(t, cfg, 0, 9, 7)
+	if err := ValidateTransaction(bad, head, signer, framePoolOpts(cfg)); !errors.Is(err, types.ErrFrameTxNonceKeyOrder) {
+		t.Fatalf("unsorted keys: got %v, want ErrFrameTxNonceKeyOrder", err)
+	}
+	// The same transaction shape with the legacy domain is admitted.
+	legacyDomain := mkPoolKeyedFrameTx(t, cfg, 0)
+	if err := ValidateTransaction(legacyDomain, head, signer, framePoolOpts(cfg)); err != nil {
+		t.Fatalf("legacy-domain (empty keys) tx must be admitted: %v", err)
 	}
 }

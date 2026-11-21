@@ -49,6 +49,7 @@ func frameChainConfig() *params.ChainConfig {
 	cfg := *params.MergedTestChainConfig
 	cfg.AmsterdamTime = new(uint64)
 	cfg.BogotaTime = new(uint64)
+	cfg.KeyedNonceTime = new(uint64) // EIP-8250: tests build keyed-form transactions
 	return &cfg
 }
 
@@ -94,14 +95,15 @@ func applyFrameTx(t *testing.T, sdb *state.StateDB, evm *vm.EVM, tx *types.Trans
 // frameTxBuilder assembles and signs a frame transaction with a single
 // default-code secp256k1 signature installed at index 0.
 type frameTxBuilder struct {
-	nonce   uint64
-	sender  common.Address
-	frames  []types.Frame
-	sigs    []types.FrameSignature
-	fees    types.FrameFees
-	chainID *uint256.Int
-	blobs   []common.Hash
-	signKey bool
+	nonce     uint64
+	nonceKeys []uint256.Int
+	sender    common.Address
+	frames    []types.Frame
+	sigs      []types.FrameSignature
+	fees      types.FrameFees
+	chainID   *uint256.Int
+	blobs     []common.Hash
+	signKey   bool
 }
 
 func newFrameTx(nonce uint64, sender common.Address) *frameTxBuilder {
@@ -115,6 +117,17 @@ func newFrameTx(nonce uint64, sender common.Address) *frameTxBuilder {
 		},
 		signKey: true,
 	}
+}
+
+// keyed selects EIP-8250 keyed nonce domains for the transaction: nonce_seq
+// is seq and each key is a uint256 nonce key.
+func (b *frameTxBuilder) keyed(seq uint64, keys ...uint64) *frameTxBuilder {
+	b.nonce = seq
+	b.nonceKeys = make([]uint256.Int, len(keys))
+	for i, k := range keys {
+		b.nonceKeys[i].SetUint64(k)
+	}
+	return b
 }
 
 func (b *frameTxBuilder) addFrame(mode, flags uint8, target *common.Address, exec, state uint64, value *uint256.Int, data []byte) *frameTxBuilder {
@@ -152,7 +165,8 @@ func (b *frameTxBuilder) build(t *testing.T) *types.Transaction {
 	}
 	ft := &types.FrameTx{
 		ChainID:    b.chainID,
-		Nonce:      b.nonce,
+		NonceKeys:  b.nonceKeys,
+		NonceSeq:   b.nonce,
 		Sender:     b.sender,
 		Frames:     b.frames,
 		Signatures: b.sigs,

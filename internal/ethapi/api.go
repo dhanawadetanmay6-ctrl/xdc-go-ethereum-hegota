@@ -1090,10 +1090,14 @@ type RPCTransaction struct {
 	Signatures []types.FrameSignature `json:"signatures,omitempty"`
 	MaxFee     *hexutil.Big           `json:"maxFee,omitempty"`
 	BlobGas    *hexutil.Uint64        `json:"blobGas,omitempty"`
-	V          *hexutil.Big           `json:"v"`
-	R          *hexutil.Big           `json:"r"`
-	S          *hexutil.Big           `json:"s"`
-	YParity    *hexutil.Uint64        `json:"yParity,omitempty"`
+	// EIP-8250 keyed nonce fields (keyed payload form; 'nonce' carries
+	// nonce_seq for both forms):
+	NonceKeys []hexutil.Big   `json:"nonceKeys,omitempty"`
+	NonceSeq  *hexutil.Uint64 `json:"nonceSeq,omitempty"`
+	V         *hexutil.Big    `json:"v"`
+	R         *hexutil.Big    `json:"r"`
+	S         *hexutil.Big    `json:"s"`
+	YParity   *hexutil.Uint64 `json:"yParity,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
@@ -1201,6 +1205,17 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		result.BlobVersionedHashes = ft.BlobHashes
 		blobGas := hexutil.Uint64(tx.BlobGas())
 		result.BlobGas = &blobGas
+		// EIP-8250: emit nonceKeys/nonceSeq for the keyed payload form
+		// (result.Nonce already carries nonce_seq via tx.Nonce()).
+		if !ft.IsLegacyPayload() {
+			seq := hexutil.Uint64(ft.NonceSeq)
+			result.NonceSeq = &seq
+			keys := make([]hexutil.Big, len(ft.NonceKeys))
+			for i := range ft.NonceKeys {
+				keys[i] = (hexutil.Big)(*ft.NonceKeys[i].ToBig())
+			}
+			result.NonceKeys = keys
+		}
 	}
 	return result
 }

@@ -60,6 +60,10 @@ type txJSON struct {
 	Signatures []FrameSignature `json:"signatures,omitempty"`
 	MaxFee     *hexutil.Big     `json:"maxFee,omitempty"`
 	BlobGas    *hexutil.Uint64  `json:"blobGas,omitempty"`
+	// EIP-8250 keyed nonce fields (keyed payload form; the legacy form keeps
+	// using 'nonce' alone):
+	NonceKeys []hexutil.Big   `json:"nonceKeys,omitempty"`
+	NonceSeq  *hexutil.Uint64 `json:"nonceSeq,omitempty"`
 
 	// Only used for encoding:
 	Hash common.Hash `json:"hash"`
@@ -183,7 +187,19 @@ func (tx *Transaction) MarshalJSON() ([]byte, error) {
 		// top-level to/value/input/gas. The frame list, signature entries and
 		// the total-budget fee fields carry the payload.
 		enc.ChainID = (*hexutil.Big)(itx.ChainID.ToBig())
-		enc.Nonce = (*hexutil.Uint64)(&itx.Nonce)
+		// EIP-8250: 'nonce' carries nonce_seq for both payload forms (it is
+		// the transaction's replay-protection sequence); the keyed form
+		// additionally emits nonceKeys/nonceSeq.
+		enc.Nonce = (*hexutil.Uint64)(&itx.NonceSeq)
+		if !itx.legacyPayload {
+			seq := hexutil.Uint64(itx.NonceSeq)
+			enc.NonceSeq = &seq
+			keys := make([]hexutil.Big, len(itx.NonceKeys))
+			for i := range itx.NonceKeys {
+				keys[i] = (hexutil.Big)(*itx.NonceKeys[i].ToBig())
+			}
+			enc.NonceKeys = keys
+		}
 		enc.Sender = &itx.Sender
 		enc.Frames = itx.Frames
 		enc.Signatures = itx.Signatures
@@ -544,10 +560,28 @@ func (tx *Transaction) UnmarshalJSON(input []byte) error {
 		if overflow {
 			return errors.New("'chainId' value overflows uint256")
 		}
-		if dec.Nonce == nil {
-			return errors.New("missing required field 'nonce' in transaction")
+		if dec.NonceKeys != nil || dec.NonceSeq != nil {
+			// EIP-8250 keyed payload form.
+			if dec.NonceSeq == nil {
+				return errors.New("missing required field 'nonceSeq' in transaction")
+			}
+			itx.NonceSeq = uint64(*dec.NonceSeq)
+			itx.NonceKeys = make([]uint256.Int, len(dec.NonceKeys))
+			for i := range dec.NonceKeys {
+				k, koverflow := uint256.FromBig(dec.NonceKeys[i].ToInt())
+				if koverflow {
+					return errors.New("'nonceKeys' entry overflows uint256")
+				}
+				itx.NonceKeys[i] = *k
+			}
+		} else {
+			// Pre-EIP-8250 legacy payload form (scalar nonce).
+			if dec.Nonce == nil {
+				return errors.New("missing required field 'nonce' or 'nonceSeq' in transaction")
+			}
+			itx.NonceSeq = uint64(*dec.Nonce)
+			itx.legacyPayload = true
 		}
-		itx.Nonce = uint64(*dec.Nonce)
 		if dec.Sender == nil {
 			return errors.New("missing required field 'sender' in transaction")
 		}

@@ -2127,6 +2127,10 @@ type ChainConfig struct {
 	AmsterdamTime *uint64 `json:"amsterdamTime,omitempty"` // Amsterdam switch time (nil = no fork, 0 = already on amsterdam)
 	VerkleTime    *uint64 `json:"verkleTime,omitempty"`    // Verkle switch time (nil = no fork, 0 = already on verkle)
 	BogotaTime    *uint64 `json:"bogotaTime,omitempty"`    // Bogota switch time (nil = no fork, 0 = already on bogota)
+	// KeyedNonceTime gates EIP-8250 keyed nonces for frame transactions.
+	// It must be at or after BogotaTime (EIP-8250 requires EIP-8141); the
+	// Rules assembly forces it off when Bogota is inactive.
+	KeyedNonceTime *uint64 `json:"keyedNonceTime,omitempty"` // Keyed nonce switch time (nil = no fork, 0 = already on)
 	// Note: UBTTime is declared further below (kept as an always-false XDC
 	// stub alongside IsUBT/IsUBTGenesis) — not duplicated here.
 
@@ -2615,6 +2619,9 @@ func (c *ChainConfig) String() string {
 	if c.BogotaTime != nil {
 		result += fmt.Sprintf(", BogotaTime: %v", *c.BogotaTime)
 	}
+	if c.KeyedNonceTime != nil {
+		result += fmt.Sprintf(", KeyedNonceTime: %v", *c.KeyedNonceTime)
+	}
 	result += "}"
 	return result
 }
@@ -2709,6 +2716,9 @@ func (c *ChainConfig) Description() string {
 	}
 	if c.BogotaTime != nil {
 		banner += fmt.Sprintf(" - Bogota:                      @%-10v\n", *c.BogotaTime)
+	}
+	if c.KeyedNonceTime != nil {
+		banner += fmt.Sprintf(" - KeyedNonce:                  @%-10v\n", *c.KeyedNonceTime)
 	}
 	if c.VerkleTime != nil {
 		banner += fmt.Sprintf(" - Verkle:                      @%-10v\n", *c.VerkleTime)
@@ -2941,6 +2951,14 @@ func (c *ChainConfig) IsBogota(num *big.Int, time uint64) bool {
 	return c.IsLondon(num) && isTimestampForked(c.BogotaTime, time)
 }
 
+// IsKeyedNonce returns whether time is either equal to the EIP-8250 keyed
+// nonce fork time or greater. The fork additionally requires Bogota
+// (EIP-8141): keyed nonces replace the frame transaction payload, which only
+// exists from Bogota.
+func (c *ChainConfig) IsKeyedNonce(num *big.Int, time uint64) bool {
+	return c.IsBogota(num, time) && isTimestampForked(c.KeyedNonceTime, time)
+}
+
 // Note: IsUBT is NOT defined here — it is declared further below as an
 // always-false XDC stub (kept so TestProcessUBT / genesis_test.go compile).
 // A duplicate definition here would be a compile error.
@@ -3124,6 +3142,7 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "bpo5", timestamp: c.BPO5Time, optional: true},
 		{name: "amsterdam", timestamp: c.AmsterdamTime, optional: true},
 		{name: "bogota", timestamp: c.BogotaTime, optional: true},
+		{name: "keyedNonce", timestamp: c.KeyedNonceTime, optional: true},
 	} {
 		if lastFork.name != "" {
 			switch {
@@ -3297,6 +3316,9 @@ func (c *ChainConfig) checkCompatible(newcfg *ChainConfig, headNumber *big.Int, 
 	}
 	if isForkTimestampIncompatible(c.BogotaTime, newcfg.BogotaTime, headTimestamp) {
 		return newTimestampCompatError("Bogota fork timestamp", c.BogotaTime, newcfg.BogotaTime)
+	}
+	if isForkTimestampIncompatible(c.KeyedNonceTime, newcfg.KeyedNonceTime, headTimestamp) {
+		return newTimestampCompatError("KeyedNonce fork timestamp", c.KeyedNonceTime, newcfg.KeyedNonceTime)
 	}
 	return nil
 }
@@ -3570,6 +3592,9 @@ type Rules struct {
 	IsBerlin, IsLondon                                      bool
 	IsMerge, IsShanghai, IsCancun, IsPrague, IsOsaka        bool
 	IsAmsterdam, IsVerkle, IsUBT, IsBogota                  bool
+	// IsKeyedNonce marks the EIP-8250 keyed-nonce rules for frame
+	// transactions. It is only ever set together with IsBogota.
+	IsKeyedNonce bool
 	// IsEIP3860 gates the EIP-3860 initcode word-cost surcharge in
 	// IntrinsicGas (state_transition.go) and the MAX_INITCODE_SIZE check.
 	// Upstream geth couples this with IsShanghai. For XDC chains, this is
@@ -3635,6 +3660,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		// timestamp-gated. nil PragueBlock => false => Prague stays off (#963).
 		isPrague = c.IsPragueBlock(num)
 	}
+	isBogota := isMerge && c.IsBogota(num, timestamp)
 	return Rules{
 		IsHomestead:      c.IsHomestead(num),
 		IsEIP150:         c.IsEIP150(num),
@@ -3658,7 +3684,8 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsAmsterdam:      isMerge && c.IsAmsterdam(num, timestamp),
 		IsVerkle:         isVerkle,
 		IsEIP4762:        isVerkle,
-		IsBogota:         isMerge && c.IsBogota(num, timestamp),
+		IsBogota:         isBogota,
+		IsKeyedNonce:     isBogota && isTimestampForked(c.KeyedNonceTime, timestamp),
 		IsUBT:            false, // XDC never activates UBT; see the IsUBT stub below
 	}
 }

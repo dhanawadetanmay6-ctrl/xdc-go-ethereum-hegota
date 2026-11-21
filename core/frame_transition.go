@@ -41,6 +41,7 @@ var (
 	ErrFrameTxSenderUnapproved = errors.New("SENDER frame without execution approval")
 	ErrFrameTxVerifyFailed     = errors.New("VERIFY frame failed")
 	ErrFrameTxNoPayer          = errors.New("frame transaction never approved payment")
+	ErrFrameTxNonceSeq         = errors.New("frame transaction keyed nonce sequence mismatch")
 	ErrFrameTxStateDB          = errors.New("frame transaction requires *state.StateDB")
 	ErrFrameTxFeeOverflow      = errors.New("frame transaction fee computation overflows uint256")
 )
@@ -108,17 +109,39 @@ func (e *frameEngine) execute() (*ExecutionResult, error) {
 	if err := tx.ValidateStatic(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrFrameTxStaticInvalid, err)
 	}
+	// EIP-8250 activation: the payload form must match the fork.
+	if err := tx.ValidateFork(e.rules.IsKeyedNonce); err != nil {
+		return nil, err
+	}
 	if chainID := e.evm.ChainConfig().ChainID; chainID != nil && tx.ChainID.ToBig().Cmp(chainID) != 0 {
 		return nil, fmt.Errorf("%w: have %v want %v", ErrFrameTxChainID, tx.ChainID, chainID)
 	}
-	// Ensure tx.nonce == state[tx.sender].nonce.
+	// EIP-8250 stateful validity, evaluated against the transaction's actual
+	// pre-state before any frame executes. The legacy account nonce is
+	// captured unconditionally for TXPARAM(0x0D).
+	legacyNonce := e.sdb.GetNonce(tx.Sender)
 	if !msg.SkipNonceChecks {
-		stNonce := e.sdb.GetNonce(tx.Sender)
-		if stNonce != tx.Nonce {
-			return nil, fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooLow, tx.Sender.Hex(), tx.Nonce, stNonce)
-		}
-		if stNonce+1 < stNonce {
-			return nil, fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax, tx.Sender.Hex(), stNonce)
+		if len(tx.NonceKeys) == 0 {
+			// Legacy domain: tx.nonce_seq == state[tx.sender].nonce.
+			if legacyNonce != tx.NonceSeq {
+				return nil, fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooLow, tx.Sender.Hex(), tx.NonceSeq, legacyNonce)
+			}
+			if legacyNonce+1 < legacyNonce {
+				return nil, fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax, tx.Sender.Hex(), legacyNonce)
+			}
+		} else {
+			// Keyed domains: every selected key must sit at nonce_seq (or
+			// be unused for the single-use form).
+			for i := range tx.NonceKeys {
+				cur := e.sdb.GetState(types.NonceManagerAddress, types.NonceSlot(tx.Sender, &tx.NonceKeys[i]))
+				if tx.NonceSeq == types.MaxNonceSeq {
+					if cur != (common.Hash{}) {
+						return nil, fmt.Errorf("%w: address %v, single-use key %v already used", ErrFrameTxNonceSeq, tx.Sender.Hex(), tx.NonceKeys[i].Dec())
+					}
+				} else if cur != common.Hash(uint256.NewInt(tx.NonceSeq).Bytes32()) {
+					return nil, fmt.Errorf("%w: address %v, key %v, tx seq: %d state: %v", ErrFrameTxNonceSeq, tx.Sender.Hex(), tx.NonceKeys[i].Dec(), tx.NonceSeq, cur.Big())
+				}
+			}
 		}
 	}
 	// The EIP-7594 per-transaction blob limit applies to frame transactions
@@ -169,6 +192,8 @@ func (e *frameEngine) execute() (*ExecutionResult, error) {
 		FrameFinalized:        make([]bool, len(tx.Frames)),
 		SigResolvedSigners:    make([]common.Address, len(tx.Signatures)),
 		SigResolvedOK:         make([]bool, len(tx.Signatures)),
+		KeyedNonce:            e.rules.IsKeyedNonce,
+		LegacyNonce:           legacyNonce,
 	}
 	for i := range tx.Signatures {
 		e.fc.SigResolvedSigners[i], e.fc.SigResolvedOK[i] = tx.ResolvedSigner(&tx.Signatures[i])

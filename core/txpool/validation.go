@@ -36,6 +36,10 @@ var (
 	// blobTxMinBlobGasPrice is the big.Int version of the configured protocol
 	// parameter to avoid constructing a new big integer for every transaction.
 	blobTxMinBlobGasPrice = big.NewInt(params.BlobTxMinBlobGasprice)
+
+	// ErrKeyedFrameNonce is returned when a keyed frame transaction's
+	// nonce sequences no longer match the NONCE_MANAGER state.
+	ErrKeyedFrameNonce = errors.New("keyed frame transaction nonce sequence mismatch")
 )
 
 // ValidationOptions define certain differences between transaction validation
@@ -198,13 +202,17 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 // validateFrameTransaction performs the stateless validation of an EIP-8141
 // frame transaction for pool admission.
 //
-// Deliberately conservative deviations from the EIP-8141 public-mempool
-// policy (see FRAME_TRANSACTIONS_IMPLEMENTATION.md): no validation-prefix
-// simulation is run here, and blob-carrying frame transactions are rejected
-// until blobpool support exists. Both are safe admission-side restrictions:
-// they can only reject transactions that a full policy might admit, never
-// accept invalid ones. State-dependent checks (nonce, worst-case funds) are
-// done by ValidateTransactionWithState; affordability uses the conservative
+// Deliberately conservative deviations from the EIP-8141/EIP-8250
+// public-mempool policy (see FRAME_TRANSACTIONS_IMPLEMENTATION.md and
+// EIP_8250_IMPLEMENTATION_REPORT.md): no validation-prefix simulation is run
+// here, and blob-carrying frame transactions are rejected until blobpool
+// support exists. Both are safe admission-side restrictions: they can only
+// reject transactions that a full policy might admit, never accept invalid
+// ones. Keyed-nonce frame transactions (nonce_keys != []) are admitted into a
+// dedicated side pool with one pending keyed transaction per sender and
+// stateful per-key sequence validation (see ValidateKeyedFrameNonceState).
+// State-dependent checks (nonce/keyed sequences, worst-case funds) are done
+// by ValidateTransactionWithState; affordability uses the conservative
 // sender-pays-everything bound via Transaction.Cost.
 func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *ValidationOptions, rules params.Rules) error {
 	if !rules.IsBogota {
@@ -214,12 +222,16 @@ func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *V
 	if ft == nil {
 		return errors.New("frame transaction payload missing")
 	}
+	// EIP-8250 activation: the payload form must match the fork.
+	if err := ft.ValidateFork(rules.IsKeyedNonce); err != nil {
+		return err
+	}
 	// Chain binding.
 	if ft.ChainID == nil || ft.ChainID.ToBig().Cmp(opts.Config.ChainID) != 0 {
 		return fmt.Errorf("%w: frame tx chain id mismatch", ErrInvalidSender)
 	}
 	// Structural constraints (frame modes, flags, batch structure, expiry
-	// frames, EIP-7825 cap, blob hash versioning).
+	// frames, nonce key set, EIP-7825 cap, blob hash versioning).
 	if err := ft.ValidateStatic(); err != nil {
 		return err
 	}
@@ -232,8 +244,9 @@ func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *V
 	if _, err := ft.ValidateSignatures(); err != nil {
 		return err
 	}
-	// EIP-2681 nonce overflow.
-	if ft.Nonce+1 < ft.Nonce {
+	// EIP-2681 nonce overflow (legacy domain only; the single-use keyed
+	// form legitimately uses MAX_NONCE_SEQ and is handled above).
+	if len(ft.NonceKeys) == 0 && ft.NonceSeq+1 < ft.NonceSeq {
 		return core.ErrNonceMax
 	}
 	// Block gas limit: the 2D execution reservation must fit the block. The
@@ -262,6 +275,26 @@ func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *V
 	}
 	if opts.MinTip != nil && ft.Fees.MaxPriorityFeePerGas.ToBig().Cmp(opts.MinTip) < 0 {
 		return fmt.Errorf("%w: max priority fee per gas %v, minimum needed %v", ErrTxGasPriceTooLow, ft.Fees.MaxPriorityFeePerGas, opts.MinTip)
+	}
+	return nil
+}
+
+// ValidateKeyedFrameNonceState performs the EIP-8250 stateful nonce checks
+// for a keyed frame transaction against the current head state: for every
+// selected key, nonce_seq must equal the stored sequence (sequential form),
+// or the slot must be unused (single-use form, nonce_seq == MAX_NONCE_SEQ).
+// It is used at admission and at every head-change revalidation, so a pending
+// keyed transaction is evicted as soon as any of its selected sequences moves.
+func ValidateKeyedFrameNonceState(ft *types.FrameTx, statedb *state.StateDB) error {
+	for i := range ft.NonceKeys {
+		cur := statedb.GetState(types.NonceManagerAddress, types.NonceSlot(ft.Sender, &ft.NonceKeys[i]))
+		if ft.NonceSeq == types.MaxNonceSeq {
+			if cur != (common.Hash{}) {
+				return fmt.Errorf("%w: single-use key %v already used", ErrKeyedFrameNonce, ft.NonceKeys[i].Dec())
+			}
+		} else if cur != common.Hash(uint256.NewInt(ft.NonceSeq).Bytes32()) {
+			return fmt.Errorf("%w: key %v, tx seq %d, state %v", ErrKeyedFrameNonce, ft.NonceKeys[i].Dec(), ft.NonceSeq, cur.Big())
+		}
 	}
 	return nil
 }
@@ -368,6 +401,24 @@ func ValidateTransactionWithState(tx *types.Transaction, signer types.Signer, op
 	if err != nil {
 		log.Error("Transaction sender recovery failed", "err", err)
 		return err
+	}
+	// EIP-8250 keyed frame transactions (nonce_keys != []) are ordered by
+	// their keyed nonce sequences, not by the sender's account nonce: the
+	// account-nonce ordering and gap checks below do not apply to them.
+	if ft := tx.FrameTxData(); ft != nil && len(ft.NonceKeys) > 0 {
+		if err := ValidateKeyedFrameNonceState(ft, opts.State); err != nil {
+			return err
+		}
+		// Worst-case funds: the conservative sender-pays-everything bound,
+		// plus everything the account's pending transactions already spend.
+		balance := opts.State.GetBalance(from).ToBig()
+		cost := tx.Cost()
+		spent := opts.ExistingExpenditure(from)
+		need := new(big.Int).Add(spent, cost)
+		if balance.Cmp(need) < 0 {
+			return fmt.Errorf("%w: balance %v, keyed frame cost %v, spent %v, overshot %v", core.ErrInsufficientFunds, balance, cost, spent, new(big.Int).Sub(need, balance))
+		}
+		return nil
 	}
 	next := opts.State.GetNonce(from)
 	if next > tx.Nonce() {

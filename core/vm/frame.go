@@ -18,6 +18,7 @@ package vm
 
 import (
 	"errors"
+	"math"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -78,6 +79,15 @@ type FrameTxContext struct {
 	// no resolved signer).
 	SigResolvedSigners []common.Address
 	SigResolvedOK      []bool
+
+	// EIP-8250 keyed nonce execution state. KeyedNonce reports whether the
+	// keyed nonce fork is active for this transaction. LegacyNonce carries
+	// the pre-state legacy account nonce of tx.sender captured during
+	// stateful validity (TXPARAM 0x0D); it is not updated by payment
+	// approval, keyed-nonce consumption, or CREATE/CREATE2 within the
+	// transaction.
+	KeyedNonce  bool
+	LegacyNonce uint64
 }
 
 // frameStateDB is the StateDB surface the frame opcodes need. *state.StateDB
@@ -94,6 +104,11 @@ type frameStateDB interface {
 	GetNonce(common.Address) uint64
 	SetNonce(common.Address, uint64, tracing.NonceChangeReason)
 	Empty(common.Address) bool
+	// EIP-8250 keyed nonce slots on the NONCE_MANAGER contract. These are
+	// protocol bookkeeping: journaled and recorded in the block access list,
+	// but not priced as SSTORE and never warming the address or slots.
+	GetState(addr common.Address, hash common.Hash) common.Hash
+	SetState(addr common.Address, key, value common.Hash) common.Hash
 }
 
 // frameDB returns the journaled frame execution state, or nil when the
@@ -149,29 +164,66 @@ func (fc *FrameTxContext) Approve(evm *EVM, gas *GasBudget, addr common.Address,
 		if fs.PayerSet {
 			return true, false
 		}
-		if scope == types.FrameFlagApproveScopeMask {
-			// APPROVE_EXECUTION_AND_PAYMENT additionally requires the target
-			// to be the sender (covered above via wantExecution).
-		}
 		if bal := sdb.GetBalance(fc.ResolvedTarget); bal == nil || bal.Cmp(fc.MaxCost) < 0 {
 			return true, false
 		}
 		if !fs.SenderApproved && !wantExecution {
 			return true, false
 		}
-		// Sender account creation state-gas charge, drawn from the current
-		// frame's state pool. Failure halts the call frame without applying
-		// any approval effects.
-		if sdb.Empty(tx.Sender) {
-			cost := uint64(params.AccountCreationSize) * evm.Context.CostPerStateByte
-			if !gas.ChargeStateStrict(cost) {
-				return false, true
+		// EIP-8250 payment-approval transition (replaces EIP-8141's sender
+		// nonce increment and its sender-existence state-gas charge).
+		//
+		// Legacy nonce overflow: incrementing the sender's nonce must not
+		// exceed MAX_NONCE_SEQ. Checked before the state-gas charge; a halt
+		// anywhere in this transition applies no approval effects (the
+		// enclosing call frame's journal discards all of it).
+		if len(tx.NonceKeys) == 0 && sdb.GetNonce(tx.Sender) == math.MaxUint64 {
+			return false, true
+		}
+		// State gas: legacy domain charges sender-account creation when the
+		// sender does not exist under the fork's EIP-8037 existence rule;
+		// keyed domains charge first use of each selected slot (a slot
+		// reading zero has never been used).
+		var nonceStateGas uint64
+		if len(tx.NonceKeys) == 0 {
+			if sdb.Empty(tx.Sender) {
+				nonceStateGas = uint64(params.AccountCreationSize) * evm.Context.CostPerStateByte
+			}
+		} else {
+			firstUse := 0
+			for i := range tx.NonceKeys {
+				slot := types.NonceSlot(tx.Sender, &tx.NonceKeys[i])
+				if sdb.GetState(types.NonceManagerAddress, slot) == (common.Hash{}) {
+					firstUse++
+				}
+			}
+			nonceStateGas = uint64(firstUse) * types.KeyedNonceFirstUseStateGas(evm.Context.CostPerStateByte)
+		}
+		if !gas.ChargeStateStrict(nonceStateGas) {
+			// The frame's state pool cannot cover the charge: halt the call
+			// frame exceptionally without applying any approval effects.
+			return false, true
+		}
+		// consume_nonce_set: exactly once per transaction, atomically with
+		// the remaining approval effects below.
+		if len(tx.NonceKeys) == 0 {
+			// Increment the sender's CURRENT account nonce (EIP-8250): an
+			// earlier frame may have changed it (account deployment, CREATE).
+			sdb.SetNonce(tx.Sender, sdb.GetNonce(tx.Sender)+1, tracing.NonceChangeEoACall)
+		} else {
+			writeSeq := tx.NonceSeq + 1
+			if tx.NonceSeq == types.MaxNonceSeq {
+				// Single-use keys are exhausted by the protocol itself.
+				writeSeq = types.MaxNonceSeq
+			}
+			writeVal := common.Hash(uint256.NewInt(writeSeq).Bytes32())
+			for i := range tx.NonceKeys {
+				sdb.SetState(types.NonceManagerAddress, types.NonceSlot(tx.Sender, &tx.NonceKeys[i]), writeVal)
 			}
 		}
 	}
 	// Apply effects (journaled).
 	if wantPayment {
-		sdb.SetNonce(tx.Sender, sdb.GetNonce(tx.Sender)+1, tracing.NonceChangeEoACall)
 		sdb.SubBalance(fc.ResolvedTarget, fc.MaxCost, tracing.BalanceDecreaseGasBuy)
 		sdb.SetFrameApproval(fc.ResolvedTarget, true, true)
 	} else {

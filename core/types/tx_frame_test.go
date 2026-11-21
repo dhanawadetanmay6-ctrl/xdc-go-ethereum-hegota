@@ -35,9 +35,9 @@ import (
 func testFrameTx() *FrameTx {
 	target := common.HexToAddress("0x000000000000000000000000000000000000dEaD")
 	return &FrameTx{
-		ChainID: uint256.NewInt(50),
-		Nonce:   7,
-		Sender:  common.HexToAddress("0x00000000000000000000000000000000c0ffee01"),
+		ChainID:  uint256.NewInt(50),
+		NonceSeq: 7,
+		Sender:   common.HexToAddress("0x00000000000000000000000000000000c0ffee01"),
 		Frames: []Frame{
 			{
 				Mode:   FrameModeVerify,
@@ -103,7 +103,7 @@ func TestFrameTxEncodeDecode(t *testing.T) {
 	if !ok {
 		t.Fatalf("decoded type %T, want *FrameTx", decoded.inner)
 	}
-	if inner.Nonce != 7 || inner.Sender != tx.inner.(*FrameTx).Sender {
+	if inner.NonceSeq != 7 || inner.Sender != tx.inner.(*FrameTx).Sender {
 		t.Fatalf("field mismatch after round trip")
 	}
 	if inner.Frames[0].Target != nil {
@@ -269,20 +269,23 @@ func TestFrameTxIntrinsicGas(t *testing.T) {
 	//   sig data:             k1: signer "" 0 + msg "" 0 + sig 65B empty-msg -> floor tokens 65*4=260 -> *4 = 1040
 	//                         arb: 0 + 0 + 3B -> 3*4=12 -> *4 = 48
 	//   value transfer:       frame1 value>0, target != sender -> 4244 (TxValueCost2780)
-	want := uint64(12000 + 950 + 52 + 2900 + 1040 + 48 + 4244)
+	//   EIP-8250 nonce data:  rlp([]) 0xc0 || rlp(7) 0x07 -> 2 nonzero bytes -> 8 tokens -> *4 = 32
+	//                         (no keys -> no keyed nonce access cost)
+	want := uint64(12000 + 950 + 52 + 2900 + 1040 + 48 + 4244 + 32)
 	if intrinsic != want {
 		t.Fatalf("intrinsic: got %d want %d", intrinsic, want)
 	}
 	// Floor: base 12000 + per-frame 950 + sigverify 2900 + value 4244 +
-	//   16 * floor_tokens; floor tokens = frame data 4B*4=16 + k1 sig 65B*4=260 + arb sig 3B*4=12 = 288
-	wantFloor := uint64(12000 + 950 + 2900 + 4244 + 16*288)
+	//   16 * floor_tokens; floor tokens = frame data 4B*4=16 + k1 sig 65B*4=260 + arb sig 3B*4=12
+	//   + nonce data 2B*4=8 = 296
+	wantFloor := uint64(12000 + 950 + 2900 + 4244 + 16*296)
 	if floor != wantFloor {
 		t.Fatalf("floor: got %d want %d", floor, wantFloor)
 	}
 	// max_gas = max(intrinsic + exec + state, floor + state)
-	//   standard = 21234 + (50000+21000) + 183600 = 275834
-	//   floor    = 24702 + 183600 = 208302
-	if got, want := tx.MaxGas(), uint64(275834); got != want {
+	//   standard = 21266 + (50000+21000) + 183600 = 275866
+	//   floor    = 24830 + 183600 = 208430
+	if got, want := tx.MaxGas(), uint64(275866); got != want {
 		t.Fatalf("max gas: got %d want %d", got, want)
 	}
 }
@@ -549,9 +552,9 @@ func TestFrameTxNoOuterSignature(t *testing.T) {
 func TestFrameTxJSONRoundTrip(t *testing.T) {
 	target := common.HexToAddress("0x1234")
 	orig := NewTx(&FrameTx{
-		ChainID: uint256.NewInt(1337),
-		Nonce:   7,
-		Sender:  common.HexToAddress("0xaaaa"),
+		ChainID:  uint256.NewInt(1337),
+		NonceSeq: 7,
+		Sender:   common.HexToAddress("0xaaaa"),
 		Frames: []Frame{
 			{Mode: FrameModeVerify, Flags: FrameFlagApproveScopeMask,
 				Limits: FrameGasLimits{Execution: 50_000}, Value: new(uint256.Int)},
@@ -577,7 +580,7 @@ func TestFrameTxJSONRoundTrip(t *testing.T) {
 		t.Fatalf("type %d, want frame", dec.Type())
 	}
 	got := dec.FrameTxData()
-	if got.Nonce != 7 || got.Sender != common.HexToAddress("0xaaaa") {
+	if got.NonceSeq != 7 || got.Sender != common.HexToAddress("0xaaaa") {
 		t.Fatal("nonce/sender mismatch")
 	}
 	if len(got.Frames) != 2 || got.Frames[1].Limits.State != 200_000 || got.Frames[1].Value.Uint64() != 42 {

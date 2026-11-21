@@ -19,6 +19,7 @@ package types
 import (
 	"bytes"
 	"errors"
+	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -78,6 +79,62 @@ var EntryPoint = common.BytesToAddress([]byte{0xaa})
 // ExpiryVerifierAddress is the deployment address of the canonical expiry
 // verifier contract (EIP-8141 EXPIRY_VERIFIER).
 var ExpiryVerifierAddress = common.HexToAddress("0x81413f0cF12e9b6a49B1D0439E081c577D57FfFf")
+
+// EIP-8250 keyed nonce constants.
+const (
+	// MaxNonceKeys bounds the number of nonce keys per frame transaction
+	// (EIP-8250 MAX_NONCE_KEYS).
+	MaxNonceKeys = 16
+	// MaxNonceSeq is the largest nonce sequence number (EIP-8250
+	// MAX_NONCE_SEQ). A transaction with nonce_keys != [] and
+	// nonce_seq == MaxNonceSeq marks every selected key single-use.
+	MaxNonceSeq = math.MaxUint64
+	// KeyedNonceAccessCost is the per-key execution-gas price of the keyed
+	// nonce slot access (EIP-8250 KEYED_NONCE_ACCESS_COST), derived from
+	// this fork's EIP-8038 schedule: COLD_STORAGE_ACCESS + STORAGE_WRITE
+	// (Amsterdam parameter values 3000 + 10000).
+	KeyedNonceAccessCost uint64 = params.ColdStorageAccessAmsterdam + params.StorageWriteAmsterdam
+)
+
+// EIP-8250 nonce manager system contract. NONCE_MANAGER_CODE is a runtime
+// equivalent to revert(0, 0): ordinary calls to NONCE_MANAGER revert with
+// empty returndata. Only the protocol writes its keyed-nonce slots.
+var (
+	NonceManagerAddress = common.HexToAddress("0x8250968C12e01A19d6F667b9B2F3b3A4d0e51cB7")
+	NonceManagerCode    = []byte{0x60, 0x00, 0x60, 0x00, 0xfd}
+)
+
+// KeyedNonceFirstUseStateGas returns the state-gas charge for the first use
+// of a keyed nonce slot: STATE_BYTES_PER_STORAGE_SET * CPSB (EIP-8037,
+// EIP-8250 KEYED_NONCE_FIRST_USE_STATE_GAS).
+func KeyedNonceFirstUseStateGas(costPerStateByte uint64) uint64 {
+	return params.StorageCreationSize * costPerStateByte
+}
+
+// NonceSlot derives the NONCE_MANAGER storage slot of (sender, nonceKey)
+// (EIP-8250): keccak256(left_pad_32(sender) || uint256_to_bytes32(nonceKey)).
+func NonceSlot(sender common.Address, nonceKey *uint256.Int) common.Hash {
+	var buf [64]byte
+	copy(buf[12:32], sender.Bytes())
+	keyBytes := nonceKey.Bytes32()
+	copy(buf[32:64], keyBytes[:])
+	return crypto.Keccak256Hash(buf[:])
+}
+
+// NonceKeysHash computes the EIP-8250 nonce keys hash:
+// keccak256(uint256_to_bytes32(len(keys)) || concat(uint256_to_bytes32(k))).
+func NonceKeysHash(keys []uint256.Int) common.Hash {
+	buf := make([]byte, 32+32*len(keys))
+	var n uint256.Int
+	n.SetUint64(uint64(len(keys)))
+	nBytes := n.Bytes32()
+	copy(buf[:32], nBytes[:])
+	for i := range keys {
+		kBytes := keys[i].Bytes32()
+		copy(buf[32+32*i:], kBytes[:])
+	}
+	return crypto.Keccak256Hash(buf)
+}
 
 // Secp256k1N and Secp256r1N are the curve orders used by signature validation.
 var (
@@ -162,12 +219,28 @@ type FrameReceipt struct {
 	Logs             []*Log
 }
 
-// FrameTx implements the EIP-8141 frame transaction type:
+// FrameTx implements the EIP-8141 frame transaction type with the EIP-8250
+// keyed-nonce payload:
 //
-//	[chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes]
+//	[chain_id, nonce_keys, nonce_seq, sender, frames, signatures, fees, blob_versioned_hashes]
+//
+// Pre-EIP-8250 wire form (legacyPayload): [chain_id, nonce, sender, frames,
+// signatures, fees, blob_versioned_hashes] — the scalar nonce is carried in
+// NonceSeq and NonceKeys is nil.
 type FrameTx struct {
-	ChainID    *uint256.Int
-	Nonce      uint64
+	ChainID *uint256.Int
+	// NonceKeys selects the nonce domains of the transaction (EIP-8250); an
+	// empty list selects the sender's legacy account nonce. Valid key lists
+	// are strictly increasing and hold at most MaxNonceKeys entries.
+	NonceKeys []uint256.Int
+	// NonceSeq is the sequence number within the selected nonce domain(s).
+	NonceSeq uint64
+	// legacyPayload marks a transaction decoded from (or re-encoding to) the
+	// pre-EIP-8250 wire layout with a scalar nonce. It is unexported: legacy
+	// transactions enter through wire decoding only; the marker preserves
+	// their hash and signature hash.
+	legacyPayload bool
+
 	Sender     common.Address
 	Frames     []Frame
 	Signatures []FrameSignature
@@ -178,18 +251,21 @@ type FrameTx struct {
 // copy creates a deep copy of the transaction data and initializes all fields.
 func (tx *FrameTx) copy() TxData {
 	cpy := &FrameTx{
-		Nonce:      tx.Nonce,
-		Sender:     tx.Sender,
-		Frames:     make([]Frame, len(tx.Frames)),
-		Signatures: make([]FrameSignature, len(tx.Signatures)),
-		BlobHashes: make([]common.Hash, len(tx.BlobHashes)),
-		ChainID:    new(uint256.Int),
+		NonceSeq:      tx.NonceSeq,
+		legacyPayload: tx.legacyPayload,
+		Sender:        tx.Sender,
+		NonceKeys:     make([]uint256.Int, len(tx.NonceKeys)),
+		Frames:        make([]Frame, len(tx.Frames)),
+		Signatures:    make([]FrameSignature, len(tx.Signatures)),
+		BlobHashes:    make([]common.Hash, len(tx.BlobHashes)),
+		ChainID:       new(uint256.Int),
 		Fees: FrameFees{
 			MaxFee:               new(uint256.Int),
 			MaxPriorityFeePerGas: new(uint256.Int),
 		},
 	}
 	copy(cpy.BlobHashes, tx.BlobHashes)
+	copy(cpy.NonceKeys, tx.NonceKeys)
 	for i, f := range tx.Frames {
 		cpy.Frames[i] = Frame{
 			Mode:   f.Mode,
@@ -279,7 +355,15 @@ func (tx *FrameTx) value() *big.Int {
 	return total
 }
 
-func (tx *FrameTx) nonce() uint64 { return tx.Nonce }
+// nonce returns the transaction's replay-protection sequence (EIP-8250
+// nonce_seq; the legacy account nonce when the transaction selects the
+// legacy domain with nonce_keys == []).
+func (tx *FrameTx) nonce() uint64 { return tx.NonceSeq }
+
+// IsLegacyPayload reports whether the transaction uses the pre-EIP-8250 wire
+// layout (scalar nonce). Legacy-payload transactions are valid only before
+// the keyed-nonce fork.
+func (tx *FrameTx) IsLegacyPayload() bool { return tx.legacyPayload }
 
 // to returns nil: a frame transaction has no single recipient.
 func (tx *FrameTx) to() *common.Address { return nil }
@@ -309,12 +393,111 @@ func (tx *FrameTx) rawSignatureValues() (v, r, s *big.Int) {
 // signature to set. It is a no-op kept for TxData interface conformance.
 func (tx *FrameTx) setSignatureValues(chainID, v, r, s *big.Int) {}
 
+// frameTxKeyedRLP is the EIP-8250 wire layout of a frame transaction:
+// [chain_id, nonce_keys, nonce_seq, sender, frames, signatures, fees,
+// blob_versioned_hashes].
+type frameTxKeyedRLP struct {
+	ChainID    *uint256.Int
+	NonceKeys  []uint256.Int
+	NonceSeq   uint64
+	Sender     common.Address
+	Frames     []Frame
+	Signatures []FrameSignature
+	Fees       FrameFees
+	BlobHashes []common.Hash
+}
+
+// frameTxLegacyRLP is the pre-EIP-8250 wire layout:
+// [chain_id, nonce, sender, frames, signatures, fees, blob_versioned_hashes].
+type frameTxLegacyRLP struct {
+	ChainID    *uint256.Int
+	Nonce      uint64
+	Sender     common.Address
+	Frames     []Frame
+	Signatures []FrameSignature
+	Fees       FrameFees
+	BlobHashes []common.Hash
+}
+
 func (tx *FrameTx) encode(b *bytes.Buffer) error {
-	return rlp.Encode(b, tx)
+	if tx.legacyPayload {
+		return rlp.Encode(b, &frameTxLegacyRLP{
+			ChainID:    tx.ChainID,
+			Nonce:      tx.NonceSeq,
+			Sender:     tx.Sender,
+			Frames:     tx.Frames,
+			Signatures: tx.Signatures,
+			Fees:       tx.Fees,
+			BlobHashes: tx.BlobHashes,
+		})
+	}
+	return rlp.Encode(b, &frameTxKeyedRLP{
+		ChainID:    tx.ChainID,
+		NonceKeys:  tx.NonceKeys,
+		NonceSeq:   tx.NonceSeq,
+		Sender:     tx.Sender,
+		Frames:     tx.Frames,
+		Signatures: tx.Signatures,
+		Fees:       tx.Fees,
+		BlobHashes: tx.BlobHashes,
+	})
 }
 
 func (tx *FrameTx) decode(input []byte) error {
-	return rlp.DecodeBytes(input, tx)
+	// EIP-8250: the frame transaction payload exists in two wire forms. The
+	// forms are discriminated by the kind of the second payload element:
+	// nonce_keys is an RLP list, the legacy nonce an RLP string.
+	content, _, err := rlp.SplitList(input)
+	if err != nil {
+		return err
+	}
+	if _, _, rest, err := rlp.Split(content); err != nil {
+		return err
+	} else if kind, _, _, err := rlp.Split(rest); err != nil {
+		return err
+	} else if kind == rlp.List {
+		var k frameTxKeyedRLP
+		if err := rlp.DecodeBytes(input, &k); err != nil {
+			return err
+		}
+		// EIP-8250 decoder rejections. RLP integer canonicality and the
+		// 2^256 bound are enforced by the rlp package's uint256 decoding.
+		if len(k.NonceKeys) > MaxNonceKeys {
+			return ErrFrameTxTooManyNonceKeys
+		}
+		if len(k.NonceKeys) == 0 && k.NonceSeq == MaxNonceSeq {
+			return ErrFrameTxEmptyKeysMaxSeq
+		}
+		for i := 1; i < len(k.NonceKeys); i++ {
+			if k.NonceKeys[i-1].Cmp(&k.NonceKeys[i]) >= 0 {
+				return ErrFrameTxNonceKeyOrder
+			}
+		}
+		tx.ChainID = k.ChainID
+		tx.NonceKeys = k.NonceKeys
+		tx.NonceSeq = k.NonceSeq
+		tx.Sender = k.Sender
+		tx.Frames = k.Frames
+		tx.Signatures = k.Signatures
+		tx.Fees = k.Fees
+		tx.BlobHashes = k.BlobHashes
+		tx.legacyPayload = false
+		return nil
+	}
+	var l frameTxLegacyRLP
+	if err := rlp.DecodeBytes(input, &l); err != nil {
+		return err
+	}
+	tx.ChainID = l.ChainID
+	tx.NonceKeys = nil
+	tx.NonceSeq = l.Nonce
+	tx.Sender = l.Sender
+	tx.Frames = l.Frames
+	tx.Signatures = l.Signatures
+	tx.Fees = l.Fees
+	tx.BlobHashes = l.BlobHashes
+	tx.legacyPayload = true
+	return nil
 }
 
 // sigHash returns the canonical transaction signature hash
@@ -352,13 +535,27 @@ func (tx *FrameTx) sigHashPayload() []any {
 		}
 		frames[i] = []any{f.Mode, f.Flags, target, []any{f.Limits.Execution, f.Limits.State}, f.Value, f.Data}
 	}
+	fees := []any{tx.Fees.MaxFee, tx.Fees.MaxPriorityFeePerGas}
+	if tx.legacyPayload {
+		// Pre-EIP-8250 layout: scalar nonce at position 1.
+		return []any{
+			tx.ChainID,
+			tx.NonceSeq,
+			tx.Sender,
+			frames,
+			sigs,
+			fees,
+			tx.BlobHashes,
+		}
+	}
 	return []any{
 		tx.ChainID,
-		tx.Nonce,
+		tx.NonceKeys,
+		tx.NonceSeq,
 		tx.Sender,
 		frames,
 		sigs,
-		[]any{tx.Fees.MaxFee, tx.Fees.MaxPriorityFeePerGas},
+		fees,
 		tx.BlobHashes,
 	}
 }
@@ -388,12 +585,32 @@ var (
 	ErrExpiryFrameStateGas      = errors.New("expiry verifier frame has non-zero state gas limit")
 	ErrExpiryFrameData          = errors.New("expiry verifier frame calldata is not 8 bytes")
 	ErrExpiryFrameMultiple      = errors.New("multiple expiry verifier frames")
+	ErrFrameTxTooManyNonceKeys  = errors.New("frame transaction exceeds MAX_NONCE_KEYS")
+	ErrFrameTxEmptyKeysMaxSeq   = errors.New("frame transaction with empty nonce keys uses single-use sequence")
+	ErrFrameTxNonceKeyOrder     = errors.New("frame transaction nonce keys not strictly increasing")
+	ErrFrameTxLegacyKeyedFork   = errors.New("legacy-payload frame transaction after the keyed nonce fork")
+	ErrFrameTxKeyedBeforeFork   = errors.New("keyed-payload frame transaction before the keyed nonce fork")
 )
 
 // ValidateStatic enforces the stateless validity constraints of EIP-8141
-// ("Constraints" section). It does not verify signatures (see
-// ValidateSignatures) and does not touch state.
+// ("Constraints") and EIP-8250 (nonce key set). It does not verify signatures
+// (see ValidateSignatures) and does not touch state.
 func (tx *FrameTx) ValidateStatic() error {
+	if !tx.legacyPayload {
+		// EIP-8250 nonce key set constraints (also enforced at decode; the
+		// checks are repeated here for locally constructed transactions).
+		if len(tx.NonceKeys) > MaxNonceKeys {
+			return ErrFrameTxTooManyNonceKeys
+		}
+		if len(tx.NonceKeys) == 0 && tx.NonceSeq == MaxNonceSeq {
+			return ErrFrameTxEmptyKeysMaxSeq
+		}
+		for i := 1; i < len(tx.NonceKeys); i++ {
+			if tx.NonceKeys[i-1].Cmp(&tx.NonceKeys[i]) >= 0 {
+				return ErrFrameTxNonceKeyOrder
+			}
+		}
+	}
 	if len(tx.Frames) == 0 {
 		return ErrFrameTxNoFrames
 	}
@@ -518,6 +735,20 @@ func add64(a, b uint64) (uint64, bool) {
 	return c, c < a
 }
 
+// ValidateFork enforces the EIP-8250 activation rule on the payload form:
+// pre-fork only the legacy (scalar nonce) payload is valid; from the fork on
+// only the keyed payload is valid ("pre-fork frame transactions do not
+// survive the boundary").
+func (tx *FrameTx) ValidateFork(isKeyedNonce bool) error {
+	if isKeyedNonce && tx.legacyPayload {
+		return ErrFrameTxLegacyKeyedFork
+	}
+	if !isKeyedNonce && !tx.legacyPayload {
+		return ErrFrameTxKeyedBeforeFork
+	}
+	return nil
+}
+
 // --- Intrinsic gas (EIP-8141 "Gas Accounting") ---
 
 // frameCalldataTokens returns the weighted token count of calldata per
@@ -546,10 +777,25 @@ func (sig *FrameSignature) SignatureGas() (uint64, bool) {
 	return 0, false
 }
 
+// nonceCalldata returns the EIP-8250 nonce encoding subject to transaction
+// data pricing: rlp(nonce_keys) || priced_nonce_seq, where priced_nonce_seq
+// is empty for the single-use form (nonce_keys != [], nonce_seq ==
+// MAX_NONCE_SEQ). The exemption does not change the payload or the signature
+// hash; it only removes the data pricing of the fixed sequence bytes.
+func (tx *FrameTx) nonceCalldata() []byte {
+	out, _ := rlp.EncodeToBytes(tx.NonceKeys)
+	if !(len(tx.NonceKeys) > 0 && tx.NonceSeq == MaxNonceSeq) {
+		seqRLP, _ := rlp.EncodeToBytes(tx.NonceSeq)
+		out = append(out, seqRLP...)
+	}
+	return out
+}
+
 // IntrinsicGas computes the frame transaction's intrinsic gas and calldata
-// floor gas (EIP-8141 "Gas Accounting"). Both are derivable from the
-// transaction fields alone. An error is returned for unknown signature
-// schemes (already excluded by ValidateStatic) or uint64 overflow.
+// floor gas (EIP-8141 "Gas Accounting", extended by EIP-8250 nonce pricing).
+// Both are derivable from the transaction fields alone. An error is returned
+// for unknown signature schemes (already excluded by ValidateStatic) or
+// uint64 overflow.
 func (tx *FrameTx) IntrinsicGas() (intrinsic uint64, floor uint64, err error) {
 	var sigVerificationCost, frameDataCost, sigDataCost, valueTransferCost uint64
 	for i := range tx.Signatures {
@@ -602,6 +848,17 @@ func (tx *FrameTx) IntrinsicGas() (intrinsic uint64, floor uint64, err error) {
 	floor, _ = add64(floor, sigVerificationCost)
 	floor, _ = add64(floor, valueTransferCost)
 	floor, _ = add64(floor, params.TxCostFloorPerToken7976*floorTokens)
+	if !tx.legacyPayload {
+		// EIP-8250: the keyed-nonce payload fields are priced as transaction
+		// data, and each key pays the cold read+write of its nonce slot.
+		// Both quantities are execution gas derivable from the transaction.
+		nc := tx.nonceCalldata()
+		nonceAccessCost := uint64(len(tx.NonceKeys)) * KeyedNonceAccessCost
+		intrinsic, _ = add64(intrinsic, frameCalldataTokens(nc)*params.TxStandardTokenCost)
+		intrinsic, _ = add64(intrinsic, nonceAccessCost)
+		floor, _ = add64(floor, params.TxCostFloorPerToken7976*frameFloorTokens(nc))
+		floor, _ = add64(floor, nonceAccessCost)
+	}
 	return intrinsic, floor, nil
 }
 

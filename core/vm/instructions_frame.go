@@ -27,17 +27,22 @@ import (
 
 // EIP-8141 introspection parameter identifiers (spec tables).
 const (
-	txParamType          = 0x00
-	txParamNonce         = 0x01
-	txParamSender        = 0x02
-	txParamMaxPrioFee    = 0x03
-	txParamMaxFee        = 0x04
-	txParamBlobCount     = 0x07
-	txParamSigHash       = 0x08
-	txParamFrameCount    = 0x09
-	txParamCurrentFrame  = 0x0a
-	txParamSigCount      = 0x0b
-	txParamStateGasLeft  = 0x0c
+	txParamType         = 0x00
+	txParamNonce        = 0x01
+	txParamSender       = 0x02
+	txParamMaxPrioFee   = 0x03
+	txParamMaxFee       = 0x04
+	txParamBlobCount    = 0x07
+	txParamSigHash      = 0x08
+	txParamFrameCount   = 0x09
+	txParamCurrentFrame = 0x0a
+	txParamSigCount     = 0x0b
+	txParamStateGasLeft = 0x0c
+	// EIP-8250 keyed nonce introspection (keyed-nonce fork only).
+	txParamLegacyNonce   = 0x0d
+	txParamNonceKeyCount = 0x0e
+	txParamNonceKeysHash = 0x0f
+	txParamNonceKey0     = 0x10
 )
 
 const (
@@ -139,7 +144,9 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	case txParamType:
 		val.SetUint64(types.FrameTxType)
 	case txParamNonce:
-		val.SetUint64(fc.Tx.Nonce)
+		// EIP-8250: the transaction's replay-protection sequence (equals
+		// the legacy account nonce only when nonce_keys == []).
+		val.SetUint64(fc.Tx.NonceSeq)
 	case txParamSender:
 		val.SetBytes(fc.Tx.Sender.Bytes())
 	case txParamMaxPrioFee:
@@ -158,6 +165,31 @@ func opTxParam(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 		val.SetUint64(uint64(len(fc.Tx.Signatures)))
 	case txParamStateGasLeft:
 		val.SetUint64(scope.Contract.Gas.StateGas)
+	case txParamLegacyNonce:
+		// EIP-8250: pre-state legacy sender nonce (transaction-scoped,
+		// not updated by approval, consumption, or CREATE within the tx).
+		if !fc.KeyedNonce {
+			return nil, errFrameTxOnly
+		}
+		val.SetUint64(fc.LegacyNonce)
+	case txParamNonceKeyCount:
+		if !fc.KeyedNonce {
+			return nil, errFrameTxOnly
+		}
+		val.SetUint64(uint64(len(fc.Tx.NonceKeys)))
+	case txParamNonceKeysHash:
+		if !fc.KeyedNonce {
+			return nil, errFrameTxOnly
+		}
+		h := types.NonceKeysHash(fc.Tx.NonceKeys)
+		val.SetBytes32(h.Bytes())
+	case txParamNonceKey0:
+		if !fc.KeyedNonce {
+			return nil, errFrameTxOnly
+		}
+		if len(fc.Tx.NonceKeys) > 0 {
+			val.Set(&fc.Tx.NonceKeys[0])
+		}
 	default:
 		return nil, errFrameTxOnly
 	}

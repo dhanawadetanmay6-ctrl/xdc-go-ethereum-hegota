@@ -266,6 +266,14 @@ type LegacyPool struct {
 	all     *lookup     // All transactions to allow lookups
 	priced  *pricedList // All transactions sorted by price
 
+	// keyedFrame holds at most one pending EIP-8250 keyed frame transaction
+	// (nonce_keys != []) per sender. Keyed transactions are valid/invalid by
+	// their NONCE_MANAGER slot sequences, not by the sender's account nonce,
+	// so they cannot live in the account-nonce-ordered pending/queue lists.
+	// One-pending-per-sender is the EIP-8141 public-mempool rule that
+	// EIP-8250 leaves unchanged.
+	keyedFrame map[common.Address]*types.Transaction
+
 	reqResetCh      chan *txpoolResetRequest
 	reqPromoteCh    chan *accountSet
 	queueTxEventCh  chan *types.Transaction
@@ -295,6 +303,7 @@ func New(config Config, chain BlockChain) *LegacyPool {
 		chainconfig:     chain.Config(),
 		signer:          signer,
 		pending:         make(map[common.Address]*list),
+		keyedFrame:      make(map[common.Address]*types.Transaction),
 		queue:           newQueue(config, signer),
 		all:             newLookup(),
 		reqResetCh:      make(chan *txpoolResetRequest),
@@ -576,6 +585,28 @@ func (pool *LegacyPool) Pending(filter txpool.PendingFilter) (map[common.Address
 			pending[addr] = lazies
 			count += len(lazies)
 		}
+	}
+	// EIP-8250: surface pending keyed frame transactions at the end of their
+	// sender's list (their ordering is independent of the account nonce).
+	// They obey the same tip and gas-cap filters as list transactions.
+	for addr, tx := range pool.keyedFrame {
+		if filter.MinTip != nil && tx.EffectiveGasTipIntCmp(filter.MinTip, filter.BaseFee) < 0 {
+			continue
+		}
+		if filter.GasLimitCap != 0 && tx.Gas() > filter.GasLimitCap {
+			continue
+		}
+		pending[addr] = append(pending[addr], &txpool.LazyTransaction{
+			Pool:      pool,
+			Hash:      tx.Hash(),
+			Tx:        tx,
+			Time:      tx.Time(),
+			GasFeeCap: uint256.MustFromBig(tx.GasFeeCap()),
+			GasTipCap: uint256.MustFromBig(tx.GasTipCap()),
+			Gas:       tx.Gas(),
+			BlobGas:   tx.BlobGas(),
+		})
+		count++
 	}
 	return pending, count
 }
@@ -913,8 +944,9 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	var (
 		_, hasPending = pool.pending[from]
 		_, hasQueued  = pool.queue.get(from)
+		_, hasKeyed   = pool.keyedFrame[from]
 	)
-	if !hasPending && !hasQueued {
+	if !hasPending && !hasQueued && !hasKeyed {
 		if err := pool.reserver.Hold(from); err != nil {
 			return false, err
 		}
@@ -995,6 +1027,13 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		}
 	}
 
+	// EIP-8250 keyed frame transactions (nonce_keys != []) bypass the
+	// account-nonce-ordered pending/queue lists entirely: their validity is
+	// keyed on NONCE_MANAGER slots, not the sender account nonce.
+	if ft := tx.FrameTxData(); ft != nil && len(ft.NonceKeys) > 0 {
+		return pool.addKeyedFrameTx(from, tx)
+	}
+
 	// Try to replace an existing transaction in the pending pool
 	if list := pool.pending[from]; list != nil && list.Contains(tx.Nonce()) {
 		// Nonce already pending, check if required price bump is met
@@ -1026,6 +1065,70 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 
 	log.Trace("Pooled new future transaction", "hash", hash, "from", from, "to", tx.To())
 	return replaced, nil
+}
+
+// ErrKeyedFramePending is returned when the sender already has a pending
+// keyed frame transaction with a different nonce identity.
+var ErrKeyedFramePending = errors.New("another keyed frame transaction already pending for sender")
+
+// sameKeyedFrameIdentity reports whether two transactions share the EIP-8250
+// mempool identity (sender, nonce_keys, nonce_seq).
+func sameKeyedFrameIdentity(a, b *types.Transaction) bool {
+	fa, fb := a.FrameTxData(), b.FrameTxData()
+	if fa == nil || fb == nil || fa.Sender != fb.Sender || fa.NonceSeq != fb.NonceSeq || len(fa.NonceKeys) != len(fb.NonceKeys) {
+		return false
+	}
+	for i := range fa.NonceKeys {
+		if fa.NonceKeys[i].Cmp(&fb.NonceKeys[i]) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// keyedFeeBumped mirrors the pending-list replacement rule: the new
+// transaction must be strictly better on both fee fields and meet the
+// configured percentage bump on both.
+func keyedFeeBumped(old, tx *types.Transaction, priceBump uint64) bool {
+	if old.GasFeeCapCmp(tx) >= 0 || old.GasTipCapCmp(tx) >= 0 {
+		return false
+	}
+	a := big.NewInt(100 + int64(priceBump))
+	thresholdFeeCap := new(big.Int).Div(new(big.Int).Mul(a, old.GasFeeCap()), big.NewInt(100))
+	thresholdTip := new(big.Int).Div(new(big.Int).Mul(a, old.GasTipCap()), big.NewInt(100))
+	return tx.GasFeeCapIntCmp(thresholdFeeCap) >= 0 && tx.GasTipCapIntCmp(thresholdTip) >= 0
+}
+
+// addKeyedFrameTx inserts an EIP-8250 keyed frame transaction into the
+// side pool. At most one keyed frame transaction is pending per sender
+// (EIP-8141's public-mempool rule, unchanged by EIP-8250). Replacement is
+// allowed only for the same (sender, nonce_keys, nonce_seq) identity with a
+// sufficient fee bump; a different identity is rejected. Stateful validity
+// (per-key sequences, funds) was already checked by validateTx.
+func (pool *LegacyPool) addKeyedFrameTx(from common.Address, tx *types.Transaction) (bool, error) {
+	if old := pool.keyedFrame[from]; old != nil {
+		if !sameKeyedFrameIdentity(old, tx) {
+			return false, ErrKeyedFramePending
+		}
+		if !keyedFeeBumped(old, tx, pool.config.PriceBump) {
+			pendingDiscardMeter.Mark(1)
+			return false, txpool.ErrReplaceUnderpriced
+		}
+		pool.all.Remove(old.Hash())
+		pool.priced.Removed(1)
+		pool.keyedFrame[from] = tx
+		pool.all.Add(tx)
+		pool.priced.Put(tx)
+		pool.queueTxEvent(tx)
+		log.Trace("Replaced keyed frame transaction", "hash", tx.Hash(), "from", from)
+		return true, nil
+	}
+	pool.keyedFrame[from] = tx
+	pool.all.Add(tx)
+	pool.priced.Put(tx)
+	pool.queueTxEvent(tx)
+	log.Trace("Pooled keyed frame transaction", "hash", tx.Hash(), "from", from)
+	return false, nil
 }
 
 // isGapped reports whether the given transaction is immediately executable.
@@ -1298,8 +1401,9 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 			var (
 				_, hasPending = pool.pending[addr]
 				_, hasQueued  = pool.queue.get(addr)
+				_, hasKeyed   = pool.keyedFrame[addr]
 			)
-			if !hasPending && !hasQueued {
+			if !hasPending && !hasQueued && !hasKeyed {
 				pool.reserver.Release(addr)
 			}
 		}()
@@ -1308,6 +1412,11 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 	pool.all.Remove(hash)
 	if outofbound {
 		pool.priced.Removed(1)
+	}
+	// Remove from the keyed frame side pool if it lives there.
+	if cur := pool.keyedFrame[addr]; cur != nil && cur.Hash() == hash {
+		delete(pool.keyedFrame, addr)
+		return 1
 	}
 	// Remove the transaction from the pending lists and reset the account nonce
 	if pending := pool.pending[addr]; pending != nil {
@@ -1632,6 +1741,30 @@ func (pool *LegacyPool) reset(oldHead, newHead *types.Header) {
 	pool.currentState = statedb
 	pool.pendingNonces = newNoncer(statedb)
 
+	// EIP-8250: at the keyed-nonce fork boundary, frame transactions whose
+	// payload form is invalid under the new head's rules do not survive
+	// ("pre-fork frame transactions ... MUST be evicted from mempools").
+	// Eviction only scans when the gate actually flipped.
+	if oldHead != nil {
+		oldRules := pool.chainconfig.Rules(oldHead.Number, oldHead.Difficulty.Sign() == 0, oldHead.Time)
+		newRules := pool.chainconfig.Rules(newHead.Number, newHead.Difficulty.Sign() == 0, newHead.Time)
+		if oldRules.IsKeyedNonce != newRules.IsKeyedNonce {
+			var evict []common.Hash
+			pool.all.Range(func(hash common.Hash, tx *types.Transaction) bool {
+				if ft := tx.FrameTxData(); ft != nil {
+					if err := ft.ValidateFork(newRules.IsKeyedNonce); err != nil {
+						evict = append(evict, hash)
+					}
+				}
+				return true
+			})
+			for _, hash := range evict {
+				log.Trace("Evicting frame transaction at keyed-nonce fork boundary", "hash", hash)
+				pool.removeTx(hash, true, true)
+			}
+		}
+	}
+
 	// Inject any transactions discarded due to reorgs
 	log.Debug("Reinjecting stale transactions", "count", len(reinject))
 	core.SenderCacher().Recover(pool.signer, reinject)
@@ -1826,8 +1959,21 @@ func (pool *LegacyPool) demoteUnexecutables() {
 			delete(pool.pending, addr)
 			pendingAddrsGauge.Dec(1)
 			if _, ok := pool.queue.get(addr); !ok {
-				pool.reserver.Release(addr)
+				if _, hasKeyed := pool.keyedFrame[addr]; !hasKeyed {
+					pool.reserver.Release(addr)
+				}
 			}
+		}
+	}
+	// EIP-8250: revalidate keyed frame transactions against the new head
+	// state. Their validity depends on the NONCE_MANAGER nonce sequences,
+	// which block inclusion or other transactions may have advanced; any
+	// selected sequence moving (including consumption by a mined keyed or
+	// legacy-domain transaction) makes the pending transaction invalid.
+	for addr, tx := range pool.keyedFrame {
+		if err := txpool.ValidateKeyedFrameNonceState(tx.FrameTxData(), pool.currentState); err != nil {
+			log.Trace("Evicting invalid keyed frame transaction", "hash", tx.Hash(), "from", addr, "err", err)
+			pool.removeTx(tx.Hash(), true, true)
 		}
 	}
 }
