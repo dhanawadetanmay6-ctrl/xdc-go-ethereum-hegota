@@ -380,6 +380,14 @@ func (miner *Miner) commitTransaction(ctx context.Context, env *environment, tx 
 	if tx.Type() == types.BlobTxType {
 		return miner.commitBlobTransaction(env, tx)
 	}
+	// EIP-8272: revalidate recent root verifier frames against the payload's
+	// actual slot number before inclusion (cheap predicate check; the frame
+	// engine remains the authoritative execution).
+	if tx.Type() == types.FrameTxType {
+		if err := core.CheckRecentRootPreInclusion(env.state, env.header.SlotNumber, tx); err != nil {
+			return err
+		}
+	}
 	receipt, bal, err := miner.applyTransaction(env, tx)
 	if err != nil {
 		return err

@@ -266,6 +266,10 @@ type LegacyPool struct {
 	all     *lookup     // All transactions to allow lookups
 	priced  *pricedList // All transactions sorted by price
 
+	// EIP-8272 recent root dependency tracking (guarded by mu).
+	rrDeps  map[common.Hash]*recentRootDep           // tx hash → dependency record
+	rrByKey map[common.Hash]map[common.Hash]struct{} // storage key → tx hashes
+
 	reqResetCh      chan *txpoolResetRequest
 	reqPromoteCh    chan *accountSet
 	queueTxEventCh  chan *types.Transaction
@@ -303,6 +307,8 @@ func New(config Config, chain BlockChain) *LegacyPool {
 		reorgDoneCh:     make(chan chan struct{}),
 		reorgShutdownCh: make(chan struct{}),
 		initDoneCh:      make(chan struct{}),
+		rrDeps:          make(map[common.Hash]*recentRootDep),
+		rrByKey:         make(map[common.Hash]map[common.Hash]struct{}),
 	}
 	pool.priced = newPricedList(pool.all)
 
@@ -650,6 +656,14 @@ func (pool *LegacyPool) validateTx(tx *types.Transaction) error {
 	if err := txpool.ValidateTransactionWithState(tx, pool.signer, opts); err != nil {
 		return err
 	}
+	// EIP-8272: stateful admission of recent root verifier frames (exact code
+	// match, tuple age/storage predicates, successful in-limit execution with
+	// the scoped SLOTNUM/SLOAD permissions). Runs after the stateless policy
+	// (ValidateFrameRecentRootPolicy) which already enforced shape, position
+	// and budget rules before any sender state was read.
+	if err := pool.validateRecentRootTx(tx); err != nil {
+		return err
+	}
 	return pool.validateAuth(tx)
 }
 
@@ -780,6 +794,7 @@ func (pool *LegacyPool) promoteSpecialTx(from common.Address, tx *types.Transact
 				"nonce", tx.Nonce(), "from", from, "oldHash", old.Hash(), "newHash", tx.Hash())
 		}
 		pool.all.Remove(old.Hash())
+		pool.dropRecentRootDeps(old.Hash())
 		pool.priced.Removed(1)
 		pendingReplaceMeter.Mark(1)
 	}
@@ -1007,10 +1022,14 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		if old != nil {
 			pool.all.Remove(old.Hash())
 			pool.priced.Removed(1)
+			pool.dropRecentRootDeps(old.Hash())
 			pendingReplaceMeter.Mark(1)
 		}
 		pool.all.Add(tx)
 		pool.priced.Put(tx)
+		// EIP-8272: dependency records are replaced atomically with the
+		// transaction.
+		pool.registerRecentRootDeps(tx)
 		pool.queueTxEvent(tx)
 		log.Trace("Pooled new executable transaction", "hash", hash, "from", from, "to", tx.To())
 
@@ -1023,6 +1042,8 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	// EIP-8272: record recent root dependencies of the admitted transaction.
+	pool.registerRecentRootDeps(tx)
 
 	log.Trace("Pooled new future transaction", "hash", hash, "from", from, "to", tx.To())
 	return replaced, nil
@@ -1091,6 +1112,7 @@ func (pool *LegacyPool) promoteTx(addr common.Address, hash common.Hash, tx *typ
 	if !inserted {
 		// An older transaction was better, discard this
 		pool.all.Remove(hash)
+		pool.dropRecentRootDeps(hash)
 		pool.priced.Removed(1)
 		pendingDiscardMeter.Mark(1)
 		return false
@@ -1098,6 +1120,7 @@ func (pool *LegacyPool) promoteTx(addr common.Address, hash common.Hash, tx *typ
 	// Otherwise discard any previous transaction and mark this
 	if old != nil {
 		pool.all.Remove(old.Hash())
+		pool.dropRecentRootDeps(old.Hash())
 		pool.priced.Removed(1)
 		pendingReplaceMeter.Mark(1)
 	} else {
@@ -1306,6 +1329,8 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 	}
 	// Remove it from the list of known transactions
 	pool.all.Remove(hash)
+	// EIP-8272: dependency records leave the pool with the transaction.
+	pool.dropRecentRootDeps(hash)
 	if outofbound {
 		pool.priced.Removed(1)
 	}
@@ -1490,6 +1515,9 @@ func (pool *LegacyPool) runReorg(done chan struct{}, reset *txpoolResetRequest, 
 	// because of another transaction (e.g. higher gas price).
 	if reset != nil {
 		pool.demoteUnexecutables()
+		// EIP-8272: revalidate recent root dependencies on the head change
+		// (slot advance, storage change, code/activation change, reorg).
+		pool.revalidateRecentRootFrames(reset.oldHead, reset.newHead)
 		if reset.newHead != nil {
 			if pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
 				pendingBaseFee := eip1559.CalcBaseFee(pool.chainconfig, reset.newHead)
@@ -1657,6 +1685,7 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address) []*types.T
 	// remove all removable transactions
 	for _, hash := range dropped {
 		pool.all.Remove(hash)
+		pool.dropRecentRootDeps(hash)
 	}
 	pool.priced.Removed(len(dropped))
 
@@ -1713,6 +1742,7 @@ func (pool *LegacyPool) truncatePending() {
 						// Drop the transaction from the global pools too
 						hash := tx.Hash()
 						pool.all.Remove(hash)
+						pool.dropRecentRootDeps(hash)
 
 						// Update the account nonce to the dropped transaction
 						pool.pendingNonces.setIfLower(offenders[i], tx.Nonce())
@@ -1738,6 +1768,7 @@ func (pool *LegacyPool) truncatePending() {
 					// Drop the transaction from the global pools too
 					hash := tx.Hash()
 					pool.all.Remove(hash)
+					pool.dropRecentRootDeps(hash)
 
 					// Update the account nonce to the dropped transaction
 					pool.pendingNonces.setIfLower(addr, tx.Nonce())
@@ -1759,6 +1790,7 @@ func (pool *LegacyPool) truncateQueue() {
 	// Remove all removable transactions from the lookup and global price list
 	for _, hash := range removed {
 		pool.all.Remove(hash)
+		pool.dropRecentRootDeps(hash)
 	}
 	pool.priced.Removed(len(removed))
 
@@ -1788,6 +1820,7 @@ func (pool *LegacyPool) demoteUnexecutables() {
 		for _, tx := range olds {
 			hash := tx.Hash()
 			pool.all.Remove(hash)
+			pool.dropRecentRootDeps(hash)
 			log.Trace("Removed old pending transaction", "hash", hash)
 		}
 		// Drop all transactions that are too costly (low balance or out of gas), and queue any invalids back for later
@@ -1795,6 +1828,7 @@ func (pool *LegacyPool) demoteUnexecutables() {
 		for _, tx := range drops {
 			hash := tx.Hash()
 			pool.all.Remove(hash)
+			pool.dropRecentRootDeps(hash)
 			log.Trace("Removed unpayable pending transaction", "hash", hash)
 		}
 		pendingNofundsMeter.Mark(int64(len(drops)))

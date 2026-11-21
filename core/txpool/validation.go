@@ -223,6 +223,14 @@ func validateFrameTransaction(tx *types.Transaction, head *types.Header, opts *V
 	if err := ft.ValidateStatic(); err != nil {
 		return err
 	}
+	// EIP-8272 public-mempool policy for transactions carrying a recent root
+	// verifier frame: canonical shape, uniqueness, fixed position, recognized
+	// validation prefix (with both protocol verifier frames skipped) and the
+	// MAX_VERIFY_GAS / MAX_VERIFY_STATE_GAS budget. Fully stateless — this
+	// runs before any sender state is read (EIP-8272 ordering requirement).
+	if err := ValidateFrameRecentRootPolicy(ft); err != nil {
+		return err
+	}
 	// Blob-carrying frame transactions need blobpool support; not implemented.
 	if len(ft.BlobHashes) > 0 {
 		return errors.New("blob-carrying frame transactions not supported by txpool")
