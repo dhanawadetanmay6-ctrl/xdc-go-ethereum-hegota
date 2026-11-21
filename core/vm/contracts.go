@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
 	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/blake2b"
 	"github.com/ethereum/go-ethereum/crypto/bn256"
@@ -51,6 +52,19 @@ type PrecompiledContract interface {
 	RequiredGas(input []byte) uint64  // RequiredPrice calculates the contract gas use
 	Run(input []byte) ([]byte, error) // Run runs the precompiled contract
 	Name() string
+}
+
+// StatefulPrecompiledContract is an optional extension of PrecompiledContract
+// for precompiled contracts whose execution needs state access (EIP-8151
+// account-code-restricted ecRecover). RunPrecompiledContract prefers
+// RunStateful over Run whenever a state database is available.
+type StatefulPrecompiledContract interface {
+	PrecompiledContract
+	// RunStateful runs the precompiled contract with access to state. The gas
+	// budget is the value remaining after the base (RequiredGas) charge; the
+	// implementation performs any additional charging itself and returns the
+	// updated budget.
+	RunStateful(stateDB StateDB, input []byte, gas GasBudget, logger *tracing.Hooks) (ret []byte, remaining GasBudget, err error)
 }
 
 // PrecompiledContracts contains the precompiled contracts supported at the given fork.
@@ -193,6 +207,31 @@ var PrecompiledContractsOsaka = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
 
+// PrecompiledContractsBogota contains the set of pre-compiled Ethereum
+// contracts used in the Bogota release: the Osaka set with the EIP-8151
+// account-code-restricted ecRecover at 0x01.
+var PrecompiledContractsBogota = PrecompiledContracts{
+	common.BytesToAddress([]byte{0x01}): &ecrecover8151{},
+	common.BytesToAddress([]byte{0x02}): &sha256hash{},
+	common.BytesToAddress([]byte{0x03}): &ripemd160hash{},
+	common.BytesToAddress([]byte{0x04}): &dataCopy{},
+	common.BytesToAddress([]byte{0x05}): &bigModExp{eip2565: true, eip7823: true, eip7883: true},
+	common.BytesToAddress([]byte{0x06}): &bn256AddIstanbul{},
+	common.BytesToAddress([]byte{0x07}): &bn256ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x08}): &bn256PairingIstanbul{},
+	common.BytesToAddress([]byte{0x09}): &blake2F{},
+	common.BytesToAddress([]byte{0x0a}): &kzgPointEvaluation{},
+	common.BytesToAddress([]byte{0x0b}): &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}): &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}): &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}): &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}): &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
+	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
+
+	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
+}
+
 // PrecompiledContractsP256Verify contains the precompiled Ethereum
 // contract specified in EIP-7212. This is exported for testing purposes.
 var PrecompiledContractsP256Verify = PrecompiledContracts{
@@ -200,6 +239,7 @@ var PrecompiledContractsP256Verify = PrecompiledContracts{
 }
 
 var (
+	PrecompiledAddressesBogota    []common.Address
 	PrecompiledAddressesOsaka     []common.Address
 	PrecompiledAddressesPrague    []common.Address
 	PrecompiledAddressesCancun    []common.Address
@@ -231,6 +271,9 @@ func init() {
 	for k := range PrecompiledContractsOsaka {
 		PrecompiledAddressesOsaka = append(PrecompiledAddressesOsaka, k)
 	}
+	for k := range PrecompiledContractsBogota {
+		PrecompiledAddressesBogota = append(PrecompiledAddressesBogota, k)
+	}
 }
 
 func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
@@ -238,7 +281,7 @@ func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	case rules.IsUBT:
 		return PrecompiledContractsVerkle
 	case rules.IsBogota:
-		return PrecompiledContractsOsaka
+		return PrecompiledContractsBogota
 	case rules.IsOsaka:
 		return PrecompiledContractsOsaka
 	case rules.IsPrague:
@@ -271,7 +314,7 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
 	case rules.IsBogota:
-		return PrecompiledAddressesOsaka
+		return PrecompiledAddressesBogota
 	case rules.IsOsaka:
 		return PrecompiledAddressesOsaka
 	case rules.IsPrague:
@@ -308,6 +351,11 @@ func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address comm
 	if rules.IsAmsterdam {
 		stateDB.Touch(address)
 	}
+	// Stateful precompiles (EIP-8151) get access to the state database and the
+	// remaining gas budget; they perform any additional charging themselves.
+	if sp, ok := p.(StatefulPrecompiledContract); ok && stateDB != nil {
+		return sp.RunStateful(stateDB, input, gas, logger)
+	}
 	output, err := p.Run(input)
 	return output, gas, err
 }
@@ -320,6 +368,13 @@ func (c *ecrecover) RequiredGas(input []byte) uint64 {
 }
 
 func (c *ecrecover) Run(input []byte) ([]byte, error) {
+	return ecrecoverRun(input)
+}
+
+// ecrecoverRun performs the ECDSA public key recovery part of the ecRecover
+// precompile: (hash, v, r, s) in, left-padded recovered address out, or nil
+// when recovery fails. Extracted verbatim from the pre-EIP-8151 ecrecover.
+func ecrecoverRun(input []byte) ([]byte, error) {
 	const ecRecoverInputLength = 128
 
 	input = common.RightPadBytes(input, ecRecoverInputLength)
@@ -352,6 +407,73 @@ func (c *ecrecover) Run(input []byte) ([]byte, error) {
 
 func (c *ecrecover) Name() string {
 	return "ECREC"
+}
+
+// ecrecover8151 implements EIP-8151 (Account Code Restricted ecRecover),
+// active from the Bogota fork: after a successful ECDSA recovery the
+// recovered account's raw code is inspected, and the address is returned only
+// when the account has empty code or exactly an EIP-7702 delegation
+// indicator. Recovery failure and a rejected code check both return empty
+// output with success = 1; insufficient gas halts with out-of-gas.
+type ecrecover8151 struct{}
+
+func (c *ecrecover8151) RequiredGas(input []byte) uint64 {
+	return params.EcrecoverGas
+}
+
+func (c *ecrecover8151) Name() string {
+	return "ECREC"
+}
+
+// Run is the stateless fallback (no account-code check without state); the
+// Bogota wiring routes through RunStateful.
+func (c *ecrecover8151) Run(input []byte) ([]byte, error) {
+	return ecrecoverRun(input)
+}
+
+// RunStateful implements the EIP-8151 modified behavior: after successful
+// recovery, charge the EIP-8038 code-check cost (cold/warm determined from
+// accessed_addresses before any read, plus one WARM_ACCESS code-query fee),
+// then warm the account, record the EIP-7928 account read, and check the raw
+// account code.
+func (c *ecrecover8151) RunStateful(stateDB StateDB, input []byte, gas GasBudget, logger *tracing.Hooks) (ret []byte, remaining GasBudget, err error) {
+	out, _ := ecrecoverRun(input)
+	if out == nil {
+		// Recovery failure: no state access, no additional charge.
+		return nil, gas, nil
+	}
+	recovered := common.BytesToAddress(out[len(out)-20:])
+
+	// EIP-8038 code-check cost: cold or warm comes from accessed_addresses,
+	// before the account is read; plus one WARM_ACCESS code-query fee. The
+	// fee is charged before the account is warmed, recorded, or read; an
+	// out-of-gas code check contributes no account access.
+	cost := params.WarmAccountAccessAmsterdam
+	if !stateDB.AddressInAccessList(recovered) {
+		cost = params.ColdAccountAccessAmsterdam
+	}
+	cost += params.WarmAccountAccessAmsterdam
+	prior, ok := gas.ChargeRegular(cost)
+	if !ok {
+		return nil, gas, ErrOutOfGas
+	}
+	if logger != nil && logger.HasGasHook() {
+		logger.EmitGasChange(prior.AsTracing(), gas.AsTracing(), tracing.GasChangeCallPrecompiledContract)
+	}
+
+	// Warm the account and read its raw code. The read is recorded for the
+	// EIP-7928 block access list by the state layer (also for absent
+	// accounts); a delegation indicator is never followed.
+	stateDB.AddAddressToAccessList(recovered)
+	code := stateDB.GetCode(recovered)
+	if len(code) == 0 {
+		return out, gas, nil
+	}
+	if _, ok := types.ParseDelegation(code); ok {
+		return out, gas, nil
+	}
+	// Rejected code check: same empty output as a failed recovery.
+	return nil, gas, nil
 }
 
 // SHA256 implemented as a native contract.
